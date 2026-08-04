@@ -663,6 +663,77 @@ def analiza_fecha_limite(texto_completo, dias_limite, etiqueta):
     return dentro, obs, fecha[0]
 
 
+# Etiquetas que suelen imprimir los recibos (CFE, agua, etc.) cuando NO traen
+# una fecha de emisión clara, pero sí una fecha de vencimiento del pago o del
+# periodo. A propósito no se exige que la fecha sea "DE" o "DEL" exacto: al
+# buscar por subcadena ("LIMITE DE PAGO" dentro de "FECHA LIMITE DE PAGO",
+# o "PAGAR ANTES DE" dentro de "PAGAR ANTES DEL DÍA") ya cubre variantes
+# comunes sin necesitar una lista larguísima.
+ETIQUETAS_FECHA_LIMITE_DOMICILIO = [
+    "LIMITE DE PAGO",
+    "PAGAR ANTES DE",
+    "CORTE A PARTIR DE",
+]
+
+
+def busca_fecha_por_etiquetas(texto, etiquetas, ventana=50):
+    """Busca una fecha que aparezca justo después de alguna de las
+    etiquetas dadas (p.ej. 'LÍMITE DE PAGO: 15 JUL 26'). A diferencia de
+    fecha_mas_reciente_razonable, aquí SÍ se aceptan fechas futuras: estas
+    etiquetas casi siempre marcan una fecha de vencimiento que cae después
+    de la fecha de emisión del recibo, incluso después de hoy si el recibo
+    es reciente.
+    Regresa (fecha, etiqueta_encontrada) o None si no se encontró nada."""
+    t_norm = normaliza(texto)
+    for etiqueta in etiquetas:
+        idx = t_norm.find(normaliza(etiqueta))
+        if idx == -1:
+            continue
+        ventana_texto = t_norm[idx: idx + len(etiqueta) + ventana]
+        fechas = busca_fechas(ventana_texto)
+        candidatas = [f for f in fechas if 2015 <= f[0].year <= HOY.year + 1]
+        if candidatas:
+            return candidatas[0][0], etiqueta
+    return None
+
+
+def analiza_comprobante_domicilio(texto_completo):
+    """Regla de vigencia del comprobante de domicilio.
+
+    Primero se usa el criterio general (cualquier fecha del texto, la más
+    reciente que no sea futura). Muchos recibos (CFE, agua, etc.) no traen
+    una fecha de emisión explícita, solo una fecha límite de pago o de
+    corte —y esa fecha casi siempre cae DESPUÉS de hoy si el recibo es
+    reciente—, así que si el criterio general no encuentra nada se busca
+    puntualmente junto a las etiquetas 'LÍMITE DE PAGO', 'PAGAR ANTES DE' o
+    'CORTE A PARTIR DE', y en ese caso SÍ se acepta aunque sea una fecha
+    futura: que la fecha de pago todavía no llegue no invalida el recibo,
+    al contrario, es señal de que es reciente. En ambos casos la regla de
+    vigencia es la misma: si la fecha encontrada tiene más de 3 meses
+    (92 días) de antigüedad respecto a hoy, se marca fuera de vigencia."""
+    dentro, obs, fecha = analiza_fecha_limite(texto_completo, 92, "el comprobante de domicilio")
+    if fecha is not None:
+        return dentro, obs, fecha
+
+    encontrada = busca_fecha_por_etiquetas(texto_completo, ETIQUETAS_FECHA_LIMITE_DOMICILIO)
+    if not encontrada:
+        return dentro, obs, fecha
+
+    fecha_etiqueta, etiqueta = encontrada
+    dias = (HOY - fecha_etiqueta).days
+    dentro2 = dias <= 92
+    if dias >= 0:
+        estado = "dentro del límite de 92 días." if dentro2 else "— FUERA DE VIGENCIA, supera el límite de 92 días."
+        obs2 = (f"No se detectó una fecha de emisión explícita, pero se encontró la fecha de "
+                f"'{etiqueta.title()}': {fecha_etiqueta.isoformat()} (hoy es {HOY.isoformat()}, "
+                f"{dias} días de antigüedad, {estado}")
+    else:
+        obs2 = (f"No se detectó una fecha de emisión explícita, pero se encontró la fecha de "
+                f"'{etiqueta.title()}': {fecha_etiqueta.isoformat()}, que todavía no llega (hoy es "
+                f"{HOY.isoformat()}) — el recibo es reciente, se considera dentro de vigencia.")
+    return dentro2, obs2, fecha_etiqueta
+
+
 # ---------------------------------------------------------------------------
 # Procesamiento principal
 # ---------------------------------------------------------------------------
@@ -720,7 +791,7 @@ def procesar_documento(ruta, nombre_candidato):
         detalles_extra.append(r["observaciones"])
 
     elif clave == "COMPROBANTE_DOMICILIO":
-        dentro, obs, fecha = analiza_fecha_limite(texto_completo, 92, "el comprobante de domicilio")
+        dentro, obs, fecha = analiza_comprobante_domicilio(texto_completo)
         fila["vigencia_ok"] = dentro
         fila["vigencia_fecha_texto"] = fecha.isoformat() if fecha else None
         detalles_extra.append(obs)
