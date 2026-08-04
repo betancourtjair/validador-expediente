@@ -25,6 +25,9 @@ COPY . .
 ENV PORT=10000
 EXPOSE 10000
 
-# gunicorn con 2 workers y timeout largo: el OCR de documentos escaneados
-# puede tardar varios segundos por archivo, así que le damos margen.
-CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT} --workers 2 --timeout 120 app:app"]
+# 1 solo worker (el plan gratuito de Render trae solo 512 MB / 0.1 CPU; dos
+# workers corriendo OCR al mismo tiempo se quedarían sin memoria) y timeout
+# largo (10 min): con varios documentos escaneados en un mismo expediente,
+# el OCR puede tardar bastante más en este tipo de instancia que en una
+# máquina de desarrollo normal.
+CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT} --workers 1 --timeout 600 app:app"]

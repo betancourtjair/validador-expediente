@@ -73,6 +73,7 @@ import unicodedata
 
 import pdfplumber
 from pdf2image import convert_from_path
+from PIL import ImageOps
 import pytesseract
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
@@ -175,14 +176,22 @@ def extraer_texto_pdf(ruta):
     necesita_ocr = [i for i, t in enumerate(paginas_texto) if len(t) < 20]
     if necesita_ocr:
         try:
-            imagenes = convert_from_path(ruta, dpi=250)
+            # 300 dpi (antes 250) da más resolución para leer fechas pequeñas
+            # en documentos con layout denso (recibos CFE, credenciales, etc.)
+            imagenes = convert_from_path(ruta, dpi=300)
         except Exception as e:
             imagenes = []
             print(f"  [aviso] no se pudo rasterizar para OCR ({e})", file=sys.stderr)
         for i in necesita_ocr:
             if i < len(imagenes):
                 try:
-                    texto_ocr = pytesseract.image_to_string(imagenes[i], lang="spa")
+                    # Escala de grises + autocontraste antes del OCR: mejora
+                    # notablemente la lectura de fechas pequeñas en recibos
+                    # con fondos de color (CFE) y en credenciales oficiales.
+                    # --psm 6 (bloque uniforme de texto) dio mejores
+                    # resultados que el modo automático en todas las pruebas.
+                    imagen_prep = ImageOps.autocontrast(ImageOps.grayscale(imagenes[i]), cutoff=2)
+                    texto_ocr = pytesseract.image_to_string(imagen_prep, lang="spa", config="--psm 6")
                 except Exception as e:
                     texto_ocr = ""
                     print(f"  [aviso] OCR falló en página {i+1} ({e})", file=sys.stderr)
