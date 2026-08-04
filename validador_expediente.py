@@ -302,20 +302,34 @@ def extraer_texto_pdf(ruta):
     # al siguiente pase, aunque ya haya salido algo de texto.
     CONFIANZA_MINIMA = 60
 
+    # IMPORTANTE (memoria): se rasteriza UNA página a la vez (first_page/
+    # last_page) y directo en escala de grises (grayscale=True en
+    # convert_from_path, en vez de rasterizar en color y convertir después)
+    # — no el PDF completo ni todas las variantes juntas. En un hosting con
+    # RAM limitada (Cloud Run con 1 GiB, Render free con 512 MiB) rasterizar
+    # TODO el documento en color a 300 dpi puede fácilmente pasar de 1 GiB
+    # entre las distintas copias en memoria (rápida + HD + rotada + ligera +
+    # fuerte) y tronar el contenedor — que es justo lo que le pasó a esta app
+    # en producción. Procesando de a una página, y liberando cada imagen con
+    # "del" apenas se deja de necesitar, el uso pico de memoria se queda muy
+    # por debajo de eso sin sacrificar la calidad del OCR.
     necesita_ocr = [i for i, t in enumerate(paginas_texto) if len(t) < 20]
     if necesita_ocr:
-        try:
-            imagenes_rapidas = convert_from_path(ruta, dpi=200)
-        except Exception as e:
-            imagenes_rapidas = []
-            print(f"  [aviso] no se pudo rasterizar para OCR ({e})", file=sys.stderr)
-
         reintentar = []
         for i in necesita_ocr:
-            if i >= len(imagenes_rapidas):
+            try:
+                imagenes_pagina = convert_from_path(
+                    ruta, dpi=200, first_page=i + 1, last_page=i + 1, grayscale=True
+                )
+            except Exception as e:
+                imagenes_pagina = []
+                print(f"  [aviso] no se pudo rasterizar la página {i+1} para OCR ({e})", file=sys.stderr)
+            if not imagenes_pagina:
                 continue
-            imagen_prep = _preprocesa_para_ocr(imagenes_rapidas[i], nivel="ligero")
+            imagen_prep = _preprocesa_para_ocr(imagenes_pagina[0], nivel="ligero")
+            del imagenes_pagina
             texto_ocr, confianza = _ocr_con_confianza(imagen_prep, lang="spa")
+            del imagen_prep
             if len(texto_ocr) > len(paginas_texto[i]):
                 paginas_texto[i] = texto_ocr
                 ocr_usado[i] = True
@@ -327,51 +341,54 @@ def extraer_texto_pdf(ruta):
             if len(texto_ocr) < 20 or confianza < CONFIANZA_MINIMA:
                 reintentar.append(i)
 
-        if reintentar:
+        for i in reintentar:
             try:
-                imagenes_hd = convert_from_path(ruta, dpi=300)
+                imagenes_pagina_hd = convert_from_path(
+                    ruta, dpi=300, first_page=i + 1, last_page=i + 1, grayscale=True
+                )
             except Exception as e:
-                imagenes_hd = []
-                print(f"  [aviso] no se pudo rasterizar en HD para OCR ({e})", file=sys.stderr)
-            for i in reintentar:
-                if i >= len(imagenes_hd):
-                    continue
-                imagen_hd = _corrige_rotacion(imagenes_hd[i])
-                # Se prueban dos variantes de preprocesamiento (con y sin
-                # binarizar — binarizar ayuda mucho con fondos de color pero
-                # en documentos de fondo claro a veces borra más de lo que
-                # ayuda) combinadas con varias configuraciones de
-                # segmentación de página de Tesseract, y se elige la que dé
-                # mayor confianza — no la primera que salga ni la más larga.
-                variantes_imagen = [
-                    _preprocesa_para_ocr(imagen_hd, nivel="ligero"),
-                    _preprocesa_para_ocr(imagen_hd, nivel="fuerte"),
-                ]
-                mejor_texto, mejor_confianza = paginas_texto[i], -1.0
-                mejoro = False
-                terminar = False
-                for imagen_candidata in variantes_imagen:
-                    for psm in ("3", "6"):
-                        try:
-                            candidato, confianza = _ocr_con_confianza(
-                                imagen_candidata, lang="spa", config=f"--psm {psm}"
-                            )
-                        except Exception as e:
-                            candidato, confianza = "", -1.0
-                            print(f"  [aviso] OCR (HD, psm {psm}) falló en página {i+1} ({e})", file=sys.stderr)
-                        if candidato and len(candidato) >= 20 and confianza > mejor_confianza:
-                            mejor_texto, mejor_confianza = candidato, confianza
-                            mejoro = True
-                        # Ya se ve confiable y con longitud razonable: no
-                        # vale la pena seguir probando más configuraciones.
-                        if mejor_confianza >= 75 and len(mejor_texto) >= 40:
-                            terminar = True
-                            break
-                    if terminar:
+                imagenes_pagina_hd = []
+                print(f"  [aviso] no se pudo rasterizar en HD la página {i+1} para OCR ({e})", file=sys.stderr)
+            if not imagenes_pagina_hd:
+                continue
+            imagen_hd = _corrige_rotacion(imagenes_pagina_hd[0])
+            del imagenes_pagina_hd
+
+            mejor_texto, mejor_confianza = paginas_texto[i], -1.0
+            mejoro = False
+            terminar = False
+            # Se prueban dos variantes de preprocesamiento (con y sin
+            # binarizar — binarizar ayuda mucho con fondos de color pero en
+            # documentos de fondo claro a veces borra más de lo que ayuda),
+            # UNA A LA VEZ (no las dos en memoria simultáneamente), cada una
+            # con dos configuraciones de segmentación de Tesseract, y se
+            # elige la de mayor confianza reportada por el propio Tesseract
+            # (no la primera que salga ni la más larga).
+            for nivel in ("ligero", "fuerte"):
+                imagen_candidata = _preprocesa_para_ocr(imagen_hd, nivel=nivel)
+                for psm in ("3", "6"):
+                    try:
+                        candidato, confianza = _ocr_con_confianza(
+                            imagen_candidata, lang="spa", config=f"--psm {psm}"
+                        )
+                    except Exception as e:
+                        candidato, confianza = "", -1.0
+                        print(f"  [aviso] OCR (HD, psm {psm}) falló en página {i+1} ({e})", file=sys.stderr)
+                    if candidato and len(candidato) >= 20 and confianza > mejor_confianza:
+                        mejor_texto, mejor_confianza = candidato, confianza
+                        mejoro = True
+                    # Ya se ve confiable y con longitud razonable: no vale la
+                    # pena seguir probando más configuraciones.
+                    if mejor_confianza >= 75 and len(mejor_texto) >= 40:
+                        terminar = True
                         break
-                if mejoro:
-                    paginas_texto[i] = mejor_texto
-                    ocr_usado[i] = True
+                del imagen_candidata
+                if terminar:
+                    break
+            del imagen_hd
+            if mejoro:
+                paginas_texto[i] = mejor_texto
+                ocr_usado[i] = True
 
     return paginas_texto, num_paginas, ocr_usado
 
