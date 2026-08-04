@@ -320,7 +320,9 @@ def analiza_cuenta_bancaria(texto_completo, nombre_candidato):
     if clabe:
         banco = CODIGOS_CLABE_BANCOS.get(clabe[:3], f"Código de banco no identificado ({clabe[:3]})")
 
-    tiene_cuenta = bool(re.search(r"(NO\.?\s*DE\s*CUENTA|NUMERO\s*DE\s*CUENTA|CUENTA\s*:?\s*\d{6,})", t_norm))
+    m_cuenta = re.search(r"(?:NO\.?\s*DE\s*CUENTA|NUMERO\s*DE\s*CUENTA|CUENTA)\s*:?\s*(\d{6,20})", t_norm)
+    numero_cuenta = m_cuenta.group(1) if m_cuenta else None
+    tiene_cuenta = numero_cuenta is not None
     nombre_ok, proporcion = nombre_coincide(texto_completo, nombre_candidato)
 
     banco_rechazado = False
@@ -350,6 +352,7 @@ def analiza_cuenta_bancaria(texto_completo, nombre_candidato):
         "banco": banco,
         "banco_rechazado": banco_rechazado,
         "clabe_detectada": clabe,
+        "numero_cuenta": numero_cuenta,
         "tiene_cuenta": tiene_cuenta,
         "nombre_coincide": nombre_ok,
         "observaciones": " ".join(obs),
@@ -396,27 +399,7 @@ def analiza_csf(paginas_texto):
 
 
 def analiza_ine(paginas_texto):
-    texto_completo = "\n".join(paginas_texto)
-    t_norm = normaliza(texto_completo)
     obs = []
-
-    # El OCR de la credencial suele meter ruido entre "VIGENCIA" y los años
-    # (números de sección, caracteres mal leídos), así que buscamos los dos
-    # años (19xx/20xx) más cercanos después de la palabra VIGENCIA en vez de
-    # exigir que estén pegados a ella.
-    vigente = None
-    idx = t_norm.find("VIGENCIA")
-    if idx != -1:
-        ventana = t_norm[idx: idx + 80]
-        anios = re.findall(r"\b(19\d{2}|20\d{2})\b", ventana)
-        if len(anios) >= 2:
-            anio_inicio, anio_fin = int(anios[-2]), int(anios[-1])
-            vigente = anio_fin >= HOY.year
-            obs.append(f"Vigencia impresa: {anio_inicio}-{anio_fin}.")
-        else:
-            obs.append("Se encontró la palabra VIGENCIA pero no dos años legibles junto a ella; revisar manualmente.")
-    else:
-        obs.append("No se detectó el rango de vigencia (AAAA-AAAA); revisar manualmente.")
 
     dos_paginas = len(paginas_texto) >= 2
     if dos_paginas:
@@ -424,21 +407,60 @@ def analiza_ine(paginas_texto):
     else:
         obs.append("El PDF trae solo 1 página: falta el reverso (o viene en archivo separado).")
 
+    # La vigencia SIEMPRE se busca en la cara frontal (página 1) — el reverso
+    # es la franja MRZ y no trae el campo "VIGENCIA", así que buscarla ahí
+    # solo metería ruido. Si el PDF llegó con una sola página, se analiza esa
+    # misma como frente.
+    texto_frente = paginas_texto[0] if paginas_texto else ""
+    t_norm = normaliza(texto_frente)
+
+    # El OCR de la credencial suele meter ruido entre "VIGENCIA" y los años
+    # (números de sección, caracteres mal leídos), así que buscamos los dos
+    # años (19xx/20xx) más cercanos después de la palabra VIGENCIA en vez de
+    # exigir que estén pegados a ella.
+    vigente = None
+    anio_fin = None
+    idx = t_norm.find("VIGENCIA")
+    if idx != -1:
+        ventana = t_norm[idx: idx + 80]
+        anios = re.findall(r"\b(19\d{2}|20\d{2})\b", ventana)
+        if len(anios) >= 2:
+            anio_inicio, anio_fin = int(anios[-2]), int(anios[-1])
+            vigente = anio_fin >= HOY.year
+            dias_para_vencer = (datetime.date(anio_fin, 12, 31) - HOY).days
+            if vigente:
+                obs.append(f"Vigencia impresa en la cara frontal: {anio_inicio}-{anio_fin} (vigente hoy {HOY.isoformat()}).")
+            else:
+                obs.append(f"Vigencia impresa en la cara frontal: {anio_inicio}-{anio_fin} — VENCIDA (venció hace {abs(dias_para_vencer)} días respecto a hoy {HOY.isoformat()}).")
+        else:
+            obs.append("Se encontró la palabra VIGENCIA en la cara frontal pero no dos años legibles junto a ella; revisar manualmente.")
+    else:
+        obs.append("No se detectó el campo de vigencia en la cara frontal; revisar manualmente.")
+
     return {
         "vigente": vigente,
+        "vigencia_anio_fin": anio_fin,
         "dos_paginas": dos_paginas,
         "observaciones": " ".join(obs),
     }
 
 
 def analiza_fecha_limite(texto_completo, dias_limite, etiqueta):
+    """Busca el campo de vigencia/fecha en el texto y lo compara contra el día
+    de hoy. Regresa (dentro_del_limite, texto_de_observacion, fecha_encontrada)."""
     fechas = busca_fechas(texto_completo)
     fecha = fecha_mas_reciente_razonable(fechas)
     if not fecha:
-        return None, f"No se detectó fecha de emisión en {etiqueta}; revisar manualmente."
+        return None, f"No se detectó el campo de vigencia/fecha en {etiqueta}; revisar manualmente.", None
     dias = (HOY - fecha[0]).days
     dentro = dias <= dias_limite
-    return dentro, f"Fecha detectada en {etiqueta}: {fecha[0].isoformat()} ({dias} días de antigüedad; límite {dias_limite} días)."
+    if dentro:
+        obs = (f"Vigencia de {etiqueta}: fecha detectada {fecha[0].isoformat()}, hoy es {HOY.isoformat()} "
+               f"({dias} días de antigüedad, dentro del límite de {dias_limite} días).")
+    else:
+        obs = (f"Vigencia de {etiqueta}: fecha detectada {fecha[0].isoformat()}, hoy es {HOY.isoformat()} "
+               f"— FUERA DE VIGENCIA ({dias} días de antigüedad, supera el límite de {dias_limite} días).")
+    return dentro, obs, fecha[0]
 
 
 # ---------------------------------------------------------------------------
@@ -481,20 +503,26 @@ def procesar_documento(ruta, nombre_candidato):
         r = analiza_csf(paginas_texto)
         fila["num_paginas_ok"] = r["num_paginas_ok"]
         fila["vigencia_ok"] = r["dentro_3_meses"]
+        fila["vigencia_fecha_texto"] = r["fecha_emision"].isoformat() if r["fecha_emision"] else None
         fila["estatus_sat"] = r["estatus"]
         detalles_extra.append(r["observaciones"])
         if not r["num_paginas_ok"]:
             detalles_extra.append("Falta la segunda hoja de la CSF en este PDF (debe traer ambas en 1 solo archivo).")
 
     elif clave == "INE":
+        # La vigencia SIEMPRE se revisa en la cara frontal (página 1) contra
+        # la fecha de hoy; que el PDF traiga ambas caras solo se checa por
+        # separado (num_paginas_ok) para no mezclar los dos criterios.
         r = analiza_ine(paginas_texto)
         fila["vigencia_ok"] = r["vigente"]
+        fila["vigencia_fecha_texto"] = f"Vigente hasta {r['vigencia_anio_fin']}" if r["vigencia_anio_fin"] else None
         fila["num_paginas_ok"] = r["dos_paginas"]
         detalles_extra.append(r["observaciones"])
 
     elif clave == "COMPROBANTE_DOMICILIO":
-        dentro, obs = analiza_fecha_limite(texto_completo, 92, "el comprobante de domicilio")
+        dentro, obs, fecha = analiza_fecha_limite(texto_completo, 92, "el comprobante de domicilio")
         fila["vigencia_ok"] = dentro
+        fila["vigencia_fecha_texto"] = fecha.isoformat() if fecha else None
         detalles_extra.append(obs)
 
     elif clave == "CUENTA_BANCARIA":
@@ -502,6 +530,7 @@ def procesar_documento(ruta, nombre_candidato):
         fila["banco"] = r["banco"]
         fila["banco_rechazado"] = r["banco_rechazado"]
         fila["clabe"] = r["clabe_detectada"]
+        fila["numero_cuenta"] = r["numero_cuenta"]
         detalles_extra.append(r["observaciones"])
         if num_paginas > 2:
             detalles_extra.append(
@@ -510,8 +539,9 @@ def procesar_documento(ruta, nombre_candidato):
             )
 
     elif clave == "ACTA_NACIMIENTO":
-        dentro, obs = analiza_fecha_limite(texto_completo, 365 * 5, "el acta de nacimiento")
-        fila["vigencia_ok_5anios"] = dentro
+        dentro, obs, fecha = analiza_fecha_limite(texto_completo, 365 * 5, "el acta de nacimiento")
+        fila["vigencia_ok"] = dentro
+        fila["vigencia_fecha_texto"] = fecha.isoformat() if fecha else None
         detalles_extra.append(obs + " (regla de 5 años detectada como práctica común; confirmar si aplica formalmente).")
 
     fila["detalle"] += " ".join(detalles_extra)
@@ -635,12 +665,57 @@ def generar_excel(candidato, filas, checklist, extra, ruta_salida):
             ws.cell(row=r, column=4, value=", ".join(item["archivos"]))
             r += 1
 
-    _autoancho(ws, [42, 26, 14, 45])
+    # --- Vigencias verificadas (INE cara frontal, comprobante de domicilio,
+    # CSF, acta) contra la fecha de hoy. Se listan aunque no se haya podido
+    # leer la fecha, para que quede visible qué falta revisar a mano. -------
+    DOCS_CON_REGLA_VIGENCIA = {"INE", "COMPROBANTE_DOMICILIO", "CSF", "ACTA_NACIMIENTO"}
+    con_vigencia = [f for f in filas if f["categoria_clave"] in DOCS_CON_REGLA_VIGENCIA]
+    r += 2
+    ws.cell(row=r, column=1, value=f"Vigencias verificadas contra hoy ({HOY.isoformat()}):").font = Font(bold=True)
+    r += 1
+    if con_vigencia:
+        _set_encabezados(ws, ["Documento", "Fecha / vigencia detectada", "Estado", "Archivo"], fila=r)
+        r += 1
+        for f in con_vigencia:
+            ws.cell(row=r, column=1, value=f["categoria"])
+            ws.cell(row=r, column=2, value=f.get("vigencia_fecha_texto") or "No se detectó")
+            vig = f.get("vigencia_ok")
+            c_estado = ws.cell(row=r, column=3, value="OK" if vig else "FUERA DE VIGENCIA — revisar" if vig is False else "Sin fecha detectada — revisar a mano")
+            c_estado.fill = VERDE if vig else ROJO if vig is False else AMARILLO
+            ws.cell(row=r, column=4, value=f["archivo"])
+            r += 1
+    else:
+        ws.cell(row=r, column=1, value="No se recibieron documentos con regla de vigencia.")
+        r += 1
+
+    # --- Datos bancarios de la carátula, exportados como texto para que no
+    # se corrompan en Excel (CLABE/cuenta con ceros a la izquierda, etc.) --
+    bancarios = [f for f in filas if f["categoria_clave"] == "CUENTA_BANCARIA"]
+    r += 2
+    ws.cell(row=r, column=1, value="Datos bancarios (carátula) — CLABE y cuenta exportados como texto:").font = Font(bold=True)
+    r += 1
+    if bancarios:
+        _set_encabezados(ws, ["Archivo", "Banco", "Número de cuenta", "CLABE"], fila=r)
+        r += 1
+        for f in bancarios:
+            ws.cell(row=r, column=1, value=f["archivo"])
+            ws.cell(row=r, column=2, value=f.get("banco") or "No identificado")
+            c_cuenta = ws.cell(row=r, column=3, value=f.get("numero_cuenta") or "No detectado")
+            c_cuenta.number_format = "@"  # forzar texto: evita notación científica o pérdida de ceros
+            c_clabe = ws.cell(row=r, column=4, value=f.get("clabe") or "No detectada")
+            c_clabe.number_format = "@"
+            r += 1
+    else:
+        ws.cell(row=r, column=1, value="No se recibió carátula bancaria.")
+        r += 1
+
+    _autoancho(ws, [42, 26, 20, 45])
 
     ws2 = wb.create_sheet("Detalle por documento")
     encabezados2 = [
         "Archivo", "Documento identificado", "Páginas", "¿Usó OCR?", "Legible",
-        "Nombre coincide", "Vigencia / fecha OK", "Banco (si aplica)", "Observaciones",
+        "Nombre coincide", "Vigencia OK", "Fecha/vigencia detectada", "Banco (si aplica)",
+        "Número de cuenta", "CLABE", "Observaciones",
     ]
     _set_encabezados(ws2, encabezados2)
     r = 2
@@ -669,16 +744,26 @@ def generar_excel(candidato, filas, checklist, extra, ruta_salida):
             c_vig = ws2.cell(row=r, column=7, value="OK" if vig else "FUERA DE RANGO — revisar")
             c_vig.fill = VERDE if vig else ROJO
 
+        ws2.cell(row=r, column=8, value=fila.get("vigencia_fecha_texto") or "—")
+
         banco = fila.get("banco")
-        c_banco = ws2.cell(row=r, column=8, value=banco or "—")
+        c_banco = ws2.cell(row=r, column=9, value=banco or "—")
         if fila.get("banco_rechazado"):
             c_banco.fill = ROJO
 
-        ws2.cell(row=r, column=9, value=fila["detalle"] + (" | Muestra: " + fila["texto_muestra"] if fila["legible"] else ""))
-        ws2.cell(row=r, column=9).alignment = Alignment(wrap_text=True, vertical="top")
+        # CLABE y número de cuenta se exportan como TEXTO (number_format "@")
+        # para que Excel no los convierta a notación científica ni les
+        # quite ceros a la izquierda.
+        c_cta = ws2.cell(row=r, column=10, value=fila.get("numero_cuenta") or "—")
+        c_cta.number_format = "@"
+        c_clabe = ws2.cell(row=r, column=11, value=fila.get("clabe") or "—")
+        c_clabe.number_format = "@"
+
+        ws2.cell(row=r, column=12, value=fila["detalle"] + (" | Muestra: " + fila["texto_muestra"] if fila["legible"] else ""))
+        ws2.cell(row=r, column=12).alignment = Alignment(wrap_text=True, vertical="top")
         r += 1
 
-    _autoancho(ws2, [30, 26, 9, 10, 12, 20, 20, 26, 70])
+    _autoancho(ws2, [30, 26, 9, 10, 12, 20, 12, 24, 22, 18, 20, 70])
     for fila_idx in range(2, r):
         ws2.row_dimensions[fila_idx].height = 45
 
