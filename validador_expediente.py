@@ -73,7 +73,7 @@ import unicodedata
 
 import pdfplumber
 from pdf2image import convert_from_path
-from PIL import ImageOps
+from PIL import ImageOps, ImageStat, ImageFilter
 import pytesseract
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
@@ -161,8 +161,133 @@ def fecha_mas_reciente_razonable(fechas, no_futuras=True):
 # Extracción de texto (nativo + OCR de respaldo)
 # ---------------------------------------------------------------------------
 
+# Límite de tiempo (segundos) por cada llamada a Tesseract. Sin esto, una
+# imagen "difícil" (foto muy ruidosa, documento con un layout raro) puede
+# hacer que el análisis de la página se tarde muchísimo y — como ya pasó una
+# vez con Render — deje la generación del Excel como pasmada. Con el límite,
+# si una sola llamada se pasa de tiempo simplemente se descarta ese intento
+# (se trata como si no hubiera podido leer nada) y se sigue con el siguiente,
+# en vez de quedarse trabada ahí.
+OCR_TIMEOUT_SEGUNDOS = 12
+
+
+def _ocr_con_confianza(imagen, lang="spa", config=""):
+    """Corre OCR y regresa (texto, confianza_promedio_0_a_100).
+
+    A diferencia de adivinar qué tan "limpio" se ve un texto contando tipos
+    de caracteres (eso falla: un OCR que lee mal puede seguir escupiendo
+    letras y espacios "normales", solo que las palabras equivocadas — se
+    ve limpio pero está mal), aquí se usa la confianza que el propio
+    Tesseract calcula por palabra (0-100, viene de image_to_data) y se
+    promedia. Es la señal más confiable para decidir si vale la pena
+    escalar a un pase más pesado, o para elegir cuál de varias
+    configuraciones de Tesseract leyó mejor una misma imagen."""
+    try:
+        datos = pytesseract.image_to_data(
+            imagen, lang=lang, config=config, timeout=OCR_TIMEOUT_SEGUNDOS,
+            output_type=pytesseract.Output.DICT,
+        )
+    except Exception:
+        return "", -1.0
+
+    lineas = {}
+    confianzas = []
+    n = len(datos.get("text", []))
+    for i in range(n):
+        texto = (datos["text"][i] or "").strip()
+        if not texto:
+            continue
+        clave_linea = (datos["block_num"][i], datos["par_num"][i], datos["line_num"][i])
+        lineas.setdefault(clave_linea, []).append(texto)
+        try:
+            conf = float(datos["conf"][i])
+        except (TypeError, ValueError):
+            conf = -1.0
+        if conf >= 0:
+            confianzas.append(conf)
+
+    texto_completo = "\n".join(" ".join(palabras) for palabras in lineas.values())
+    confianza_prom = sum(confianzas) / len(confianzas) if confianzas else -1.0
+    return texto_completo, confianza_prom
+
+
+def _preprocesa_para_ocr(imagen, nivel="ligero"):
+    """Prepara una imagen antes de mandarla al OCR.
+    - 'ligero': escala de grises + autocontraste. No es OCR, es solo
+      procesamiento de imagen (barato en CPU), así que se aplica siempre
+      desde el pase rápido — ayuda bastante con fotos de celular con poco
+      contraste o fondos de color, sin costo extra relevante.
+    - 'fuerte': lo anterior + binarización (blanco/negro, usando el brillo
+      promedio de la imagen para fijar el umbral) + nitidez. Es lo que más
+      ayuda con documentos que a simple vista se ven bien pero el OCR lee
+      mal: fondos de color en credenciales, sombras, brillo del flash, papel
+      térmico desteñido. Es más pesado, por eso solo se usa en el pase HD, y
+      solo para las páginas que ya fallaron el pase rápido."""
+    gris = ImageOps.grayscale(imagen)
+    # OJO: cutoff>0 aquí puede ser CONTRAPRODUCENTE. Se probó con cutoff=2
+    # (recorta el 2% más oscuro/claro del histograma antes de estirar el
+    # contraste) y en un documento de fondo casi blanco con poco texto
+    # oscuro, ese recorte metía un patrón de moteado en las letras que hacía
+    # que Tesseract no reconociera NADA en un documento perfectamente
+    # legible a simple vista. cutoff=0 (usar el mínimo/máximo real de la
+    # imagen para estirar el contraste, sin recortar nada) no tiene ese
+    # problema y sigue ayudando con fotos de bajo contraste.
+    gris = ImageOps.autocontrast(gris, cutoff=0)
+    if nivel == "ligero":
+        return gris
+    brillo_medio = ImageStat.Stat(gris).mean[0]
+    umbral = max(100, min(200, brillo_medio * 0.85))
+    binaria = gris.point(lambda x: 255 if x > umbral else 0)
+    return binaria.filter(ImageFilter.SHARPEN)
+
+
+def _corrige_rotacion(imagen):
+    """Detecta si la imagen viene rotada 90/180/270° —común cuando el
+    candidato fotografía su credencial o comprobante con el celular en la
+    orientación equivocada, lo cual hace que Tesseract no reconozca casi nada
+    aunque el documento sea perfectamente legible— y la corrige antes del
+    OCR. Si Tesseract no logra determinar la orientación (imagen muy
+    ruidosa) simplemente se deja igual."""
+    try:
+        osd = pytesseract.image_to_osd(
+            imagen, output_type=pytesseract.Output.DICT, timeout=OCR_TIMEOUT_SEGUNDOS
+        )
+        angulo = int(osd.get("rotate", 0) or 0)
+        # PIL's Image.rotate(x) gira en sentido antihorario x grados; el
+        # campo "rotate" que regresa Tesseract ya viene en la convención que
+        # hace falta pasarle directo (probado empíricamente: usar -angulo
+        # deja la imagen al revés). Por eso aquí es rotate(angulo), sin signo
+        # invertido.
+        if angulo:
+            return imagen.rotate(angulo, expand=True)
+    except Exception:
+        pass
+    return imagen
+
+
 def extraer_texto_pdf(ruta):
-    """Regresa (lista_de_texto_por_pagina, num_paginas, uso_ocr_por_pagina)."""
+    """Regresa (lista_de_texto_por_pagina, num_paginas, uso_ocr_por_pagina).
+
+    Estrategia de OCR en 2 pasos:
+      1) Pase rápido (200 dpi + gris/autocontraste ligero) — resuelve la
+         gran mayoría de documentos escaneados o fotografiados con luz
+         decente, y sigue siendo barato en CPU (funciona incluso en un
+         hosting con muy pocos recursos).
+      2) Solo para las páginas que el pase rápido no leyó bien —ya sea
+         porque salió muy poco texto, o porque Tesseract mismo reporta poca
+         confianza en lo que leyó (típico de una foto con glare, sombra o
+         fondo de color, aunque el documento sea legible a simple vista)—
+         un pase HD (300 dpi) que además:
+           - corrige automáticamente la rotación (fotos tomadas de lado),
+           - prueba la imagen con y sin binarizar, y
+           - prueba dos configuraciones de segmentación de Tesseract
+             (--psm 3 y 6),
+         quedándose con la combinación de mayor confianza reportada por el
+         propio Tesseract (no la primera que salga ni la más larga). Cada
+         intento individual tiene un límite de tiempo (OCR_TIMEOUT_SEGUNDOS)
+         para que una imagen realmente mala no trabe la generación completa
+         del Excel.
+    """
     paginas_texto = []
     ocr_usado = []
     with pdfplumber.open(ruta) as pdf:
@@ -172,17 +297,11 @@ def extraer_texto_pdf(ruta):
             paginas_texto.append(texto)
             ocr_usado.append(False)
 
-    # Si alguna página no trajo texto nativo suficiente, se manda a OCR.
-    # OJO: el hosting gratuito (Render free tier) tiene muy poco CPU (0.1
-    # núcleo), así que aquí se usa una estrategia de dos pasos para no
-    # tronar/tardar una eternidad en cada documento:
-    #   1) Pasada rápida (200 dpi, sin preprocesar) — suficiente para la
-    #      gran mayoría de documentos escaneados.
-    #   2) Solo si esa pasada trae muy poco texto, una pasada más pesada
-    #      (300 dpi + escala de grises + autocontraste + --psm 6) que lee
-    #      mejor fechas chiquitas en fondos con ruido (recibos CFE, etc.)
-    #      pero es más lenta — por eso NO se usa de entrada en todas las
-    #      páginas, solo como reintento puntual.
+    # Umbral de confianza (0-100, escala propia de Tesseract) bajo el cual se
+    # considera que un pase de OCR "no se puede confiar" y conviene escalar
+    # al siguiente pase, aunque ya haya salido algo de texto.
+    CONFIANZA_MINIMA = 60
+
     necesita_ocr = [i for i, t in enumerate(paginas_texto) if len(t) < 20]
     if necesita_ocr:
         try:
@@ -195,16 +314,17 @@ def extraer_texto_pdf(ruta):
         for i in necesita_ocr:
             if i >= len(imagenes_rapidas):
                 continue
-            try:
-                texto_ocr = pytesseract.image_to_string(imagenes_rapidas[i], lang="spa")
-            except Exception as e:
-                texto_ocr = ""
-                print(f"  [aviso] OCR (rápido) falló en página {i+1} ({e})", file=sys.stderr)
-            texto_ocr = texto_ocr.strip()
+            imagen_prep = _preprocesa_para_ocr(imagenes_rapidas[i], nivel="ligero")
+            texto_ocr, confianza = _ocr_con_confianza(imagen_prep, lang="spa")
             if len(texto_ocr) > len(paginas_texto[i]):
                 paginas_texto[i] = texto_ocr
                 ocr_usado[i] = True
-            if len(texto_ocr) < 20:
+            # Se reintenta con el pase HD no solo si vino muy poco texto,
+            # sino también si Tesseract mismo reporta poca confianza en lo
+            # que leyó —eso es justo lo que pasa con documentos legibles a
+            # simple vista pero que el pase rápido lee mal (poca luz, glare,
+            # fondo de color)—.
+            if len(texto_ocr) < 20 or confianza < CONFIANZA_MINIMA:
                 reintentar.append(i)
 
         if reintentar:
@@ -216,14 +336,41 @@ def extraer_texto_pdf(ruta):
             for i in reintentar:
                 if i >= len(imagenes_hd):
                     continue
-                try:
-                    imagen_prep = ImageOps.autocontrast(ImageOps.grayscale(imagenes_hd[i]), cutoff=2)
-                    texto_ocr = pytesseract.image_to_string(imagen_prep, lang="spa", config="--psm 6")
-                except Exception as e:
-                    texto_ocr = ""
-                    print(f"  [aviso] OCR (HD) falló en página {i+1} ({e})", file=sys.stderr)
-                if len(texto_ocr.strip()) > len(paginas_texto[i]):
-                    paginas_texto[i] = texto_ocr.strip()
+                imagen_hd = _corrige_rotacion(imagenes_hd[i])
+                # Se prueban dos variantes de preprocesamiento (con y sin
+                # binarizar — binarizar ayuda mucho con fondos de color pero
+                # en documentos de fondo claro a veces borra más de lo que
+                # ayuda) combinadas con varias configuraciones de
+                # segmentación de página de Tesseract, y se elige la que dé
+                # mayor confianza — no la primera que salga ni la más larga.
+                variantes_imagen = [
+                    _preprocesa_para_ocr(imagen_hd, nivel="ligero"),
+                    _preprocesa_para_ocr(imagen_hd, nivel="fuerte"),
+                ]
+                mejor_texto, mejor_confianza = paginas_texto[i], -1.0
+                mejoro = False
+                terminar = False
+                for imagen_candidata in variantes_imagen:
+                    for psm in ("3", "6"):
+                        try:
+                            candidato, confianza = _ocr_con_confianza(
+                                imagen_candidata, lang="spa", config=f"--psm {psm}"
+                            )
+                        except Exception as e:
+                            candidato, confianza = "", -1.0
+                            print(f"  [aviso] OCR (HD, psm {psm}) falló en página {i+1} ({e})", file=sys.stderr)
+                        if candidato and len(candidato) >= 20 and confianza > mejor_confianza:
+                            mejor_texto, mejor_confianza = candidato, confianza
+                            mejoro = True
+                        # Ya se ve confiable y con longitud razonable: no
+                        # vale la pena seguir probando más configuraciones.
+                        if mejor_confianza >= 75 and len(mejor_texto) >= 40:
+                            terminar = True
+                            break
+                    if terminar:
+                        break
+                if mejoro:
+                    paginas_texto[i] = mejor_texto
                     ocr_usado[i] = True
 
     return paginas_texto, num_paginas, ocr_usado

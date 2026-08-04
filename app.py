@@ -100,11 +100,13 @@ PAGINA = """
   .doc.req{background:#f0f8f4;border-color:#bfe4d3;}
   .tag{font-size:.7rem;background:#0f6b4c;color:#fff;padding:2px 6px;border-radius:10px;margin-left:6px;}
   button{background:#0f6b4c;color:#fff;border:none;padding:12px 22px;border-radius:8px;font-size:1rem;cursor:pointer;}
+  button:disabled{opacity:.6;cursor:not-allowed;}
+  #estado{margin-top:14px;font-size:.9rem;font-weight:600;min-height:1.2em;}
 </style>
 </head>
 <body>
 <h1>Validador de Expediente de Reclutamiento</h1>
-<form method="post" action="/validar" enctype="multipart/form-data">
+<form method="post" action="/validar" enctype="multipart/form-data" id="formValidador">
   <div class="campo">
     <label>Nombre completo del candidato</label>
     <input type="text" name="nombre" required>
@@ -127,8 +129,68 @@ PAGINA = """
     <label>Otros documentos adicionales (puedes seleccionar varios)</label>
     <input type="file" name="otros" multiple accept="application/pdf">
   </div>
-  <button type="submit">Validar y generar Excel</button>
+  <button type="submit" id="btnSubmit">Validar y generar Excel</button>
+  <div id="estado"></div>
 </form>
+<script>
+// Se manda el formulario por fetch (en vez de un submit normal) para poder
+// limpiarlo por completo -incluyendo los archivos ya seleccionados- justo
+// después de que se descargue el Excel, y así quede listo para capturar al
+// siguiente candidato sin tener que quitar archivo por archivo a mano.
+(function () {
+  var form = document.getElementById("formValidador");
+  var boton = document.getElementById("btnSubmit");
+  var estado = document.getElementById("estado");
+
+  form.addEventListener("submit", function (ev) {
+    ev.preventDefault();
+    estado.style.color = "#0f6b4c";
+    estado.textContent = "Procesando documentos (puede tardar uno o dos minutos)...";
+    boton.disabled = true;
+    boton.textContent = "Procesando...";
+
+    var datos = new FormData(form);
+
+    fetch(form.getAttribute("action"), { method: "POST", body: datos })
+      .then(function (resp) {
+        if (!resp.ok) {
+          return resp.text().then(function (txt) {
+            throw new Error(txt || ("Error del servidor (" + resp.status + ")"));
+          });
+        }
+        var disposicion = resp.headers.get("Content-Disposition") || "";
+        var m = disposicion.match(/filename="?([^"]+)"?/);
+        var nombreArchivo = m ? m[1] : "expediente.xlsx";
+        return resp.blob().then(function (blob) {
+          return { blob: blob, nombre: nombreArchivo };
+        });
+      })
+      .then(function (resultado) {
+        var url = window.URL.createObjectURL(resultado.blob);
+        var a = document.createElement("a");
+        a.href = url;
+        a.download = resultado.nombre;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        window.URL.revokeObjectURL(url);
+
+        // Limpia nombre/RFC/CURP y TODOS los archivos seleccionados.
+        form.reset();
+        estado.style.color = "#0f6b4c";
+        estado.textContent = "Listo: se descargó " + resultado.nombre + ". El formulario ya está limpio para el siguiente candidato.";
+      })
+      .catch(function (err) {
+        estado.style.color = "#b3261e";
+        estado.textContent = "Ocurrió un error: " + err.message + " (no se borró nada, puedes reintentar).";
+      })
+      .finally(function () {
+        boton.disabled = false;
+        boton.textContent = "Validar y generar Excel";
+      });
+  });
+})();
+</script>
 </body>
 </html>
 """
@@ -151,53 +213,68 @@ def validar():
 
     candidato = {"nombre": nombre, "rfc": rfc, "curp": curp}
 
-    with tempfile.TemporaryDirectory() as tmp:
-        rutas = []
-        for campo, _etiqueta, _ob in CAMPOS_DOCUMENTOS:
-            f = request.files.get(campo)
-            if f and f.filename:
-                ruta = os.path.join(tmp, f.filename)
-                f.save(ruta)
-                rutas.append(ruta)
-        for f in request.files.getlist("otros"):
-            if f and f.filename:
-                ruta = os.path.join(tmp, f.filename)
-                f.save(ruta)
-                rutas.append(ruta)
+    # Todo lo que se sube (PDFs) y el Excel generado viven SOLO dentro de este
+    # directorio temporal: al salir del "with" (ya sea que todo salga bien o
+    # truene una excepción) Python lo borra del disco del servidor por
+    # completo. O sea que en el servidor nunca queda nada guardado de un
+    # candidato al siguiente; lo que faltaba para "empezar de cero" era
+    # limpiar el FORMULARIO en el navegador después de descargar el Excel
+    # (ver el <script> en PAGINA, que hace form.reset() tras la descarga).
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            rutas = []
+            for campo, _etiqueta, _ob in CAMPOS_DOCUMENTOS:
+                f = request.files.get(campo)
+                if f and f.filename:
+                    ruta = os.path.join(tmp, f.filename)
+                    f.save(ruta)
+                    rutas.append(ruta)
+            for f in request.files.getlist("otros"):
+                if f and f.filename:
+                    ruta = os.path.join(tmp, f.filename)
+                    f.save(ruta)
+                    rutas.append(ruta)
 
-        if not rutas:
-            return "No se recibió ningún documento", 400
+            if not rutas:
+                return "No se recibió ningún documento", 400
 
-        # Log de progreso a stdout: en el plan gratuito de Render el OCR
-        # puede tardar bastante (poco CPU disponible). Sin esto, si algo se
-        # traba no hay ninguna pista en los logs de qué archivo fue.
-        print(f"[validar] iniciando expediente de '{nombre}' con {len(rutas)} documento(s)", file=sys.stderr, flush=True)
+            # Log de progreso a stdout: en el plan gratuito de Render el OCR
+            # puede tardar bastante (poco CPU disponible). Sin esto, si algo se
+            # traba no hay ninguna pista en los logs de qué archivo fue.
+            print(f"[validar] iniciando expediente de '{nombre}' con {len(rutas)} documento(s)", file=sys.stderr, flush=True)
 
-        filas = []
-        for ruta in rutas:
-            t0 = time.time()
-            print(f"[validar]   procesando {os.path.basename(ruta)} ...", file=sys.stderr, flush=True)
-            try:
-                fila = ve.procesar_documento(ruta, candidato["nombre"])
-            except Exception as e:
-                fila = {
-                    "archivo": os.path.basename(ruta), "categoria_clave": "ERROR",
-                    "categoria": "Error al procesar", "num_paginas": 0, "uso_ocr": False,
-                    "legible": False, "texto_muestra": "", "nombre_coincide": None,
-                    "detalle": f"Error: {e}",
-                }
-            print(f"[validar]   listo {os.path.basename(ruta)} ({time.time() - t0:.1f}s)", file=sys.stderr, flush=True)
-            filas.append(fila)
+            filas = []
+            for ruta in rutas:
+                t0 = time.time()
+                print(f"[validar]   procesando {os.path.basename(ruta)} ...", file=sys.stderr, flush=True)
+                try:
+                    fila = ve.procesar_documento(ruta, candidato["nombre"])
+                except Exception as e:
+                    fila = {
+                        "archivo": os.path.basename(ruta), "categoria_clave": "ERROR",
+                        "categoria": "Error al procesar", "num_paginas": 0, "uso_ocr": False,
+                        "legible": False, "texto_muestra": "", "nombre_coincide": None,
+                        "detalle": f"Error: {e}",
+                    }
+                print(f"[validar]   listo {os.path.basename(ruta)} ({time.time() - t0:.1f}s)", file=sys.stderr, flush=True)
+                filas.append(fila)
 
-        checklist, extra = ve.construir_reporte(candidato, filas)
+            checklist, extra = ve.construir_reporte(candidato, filas)
 
-        salida = os.path.join(tmp, "expediente.xlsx")
-        ve.generar_excel(candidato, filas, checklist, extra, salida)
+            salida = os.path.join(tmp, "expediente.xlsx")
+            ve.generar_excel(candidato, filas, checklist, extra, salida)
 
-        with open(salida, "rb") as fh:
-            data = fh.read()
+            with open(salida, "rb") as fh:
+                data = fh.read()
 
-        print(f"[validar] expediente de '{nombre}' listo", file=sys.stderr, flush=True)
+            print(f"[validar] expediente de '{nombre}' listo", file=sys.stderr, flush=True)
+    except Exception as e:
+        # Cualquier error inesperado (no solo los de un documento en
+        # particular, que ya se capturan arriba) se reporta como texto plano
+        # en vez de dejar pasar la página de error genérica de Flask — así el
+        # aviso que ve la persona en el formulario es entendible.
+        print(f"[validar] ERROR inesperado con el expediente de '{nombre}': {e}", file=sys.stderr, flush=True)
+        return f"Ocurrió un error inesperado generando el expediente: {e}", 500
 
     nombre_archivo = f"expediente_{nombre.strip().replace(' ', '_') or 'candidato'}.xlsx"
     return send_file(
