@@ -173,28 +173,55 @@ def extraer_texto_pdf(ruta):
             ocr_usado.append(False)
 
     # Si alguna página no trajo texto nativo suficiente, se manda a OCR.
+    # OJO: el hosting gratuito (Render free tier) tiene muy poco CPU (0.1
+    # núcleo), así que aquí se usa una estrategia de dos pasos para no
+    # tronar/tardar una eternidad en cada documento:
+    #   1) Pasada rápida (200 dpi, sin preprocesar) — suficiente para la
+    #      gran mayoría de documentos escaneados.
+    #   2) Solo si esa pasada trae muy poco texto, una pasada más pesada
+    #      (300 dpi + escala de grises + autocontraste + --psm 6) que lee
+    #      mejor fechas chiquitas en fondos con ruido (recibos CFE, etc.)
+    #      pero es más lenta — por eso NO se usa de entrada en todas las
+    #      páginas, solo como reintento puntual.
     necesita_ocr = [i for i, t in enumerate(paginas_texto) if len(t) < 20]
     if necesita_ocr:
         try:
-            # 300 dpi (antes 250) da más resolución para leer fechas pequeñas
-            # en documentos con layout denso (recibos CFE, credenciales, etc.)
-            imagenes = convert_from_path(ruta, dpi=300)
+            imagenes_rapidas = convert_from_path(ruta, dpi=200)
         except Exception as e:
-            imagenes = []
+            imagenes_rapidas = []
             print(f"  [aviso] no se pudo rasterizar para OCR ({e})", file=sys.stderr)
+
+        reintentar = []
         for i in necesita_ocr:
-            if i < len(imagenes):
+            if i >= len(imagenes_rapidas):
+                continue
+            try:
+                texto_ocr = pytesseract.image_to_string(imagenes_rapidas[i], lang="spa")
+            except Exception as e:
+                texto_ocr = ""
+                print(f"  [aviso] OCR (rápido) falló en página {i+1} ({e})", file=sys.stderr)
+            texto_ocr = texto_ocr.strip()
+            if len(texto_ocr) > len(paginas_texto[i]):
+                paginas_texto[i] = texto_ocr
+                ocr_usado[i] = True
+            if len(texto_ocr) < 20:
+                reintentar.append(i)
+
+        if reintentar:
+            try:
+                imagenes_hd = convert_from_path(ruta, dpi=300)
+            except Exception as e:
+                imagenes_hd = []
+                print(f"  [aviso] no se pudo rasterizar en HD para OCR ({e})", file=sys.stderr)
+            for i in reintentar:
+                if i >= len(imagenes_hd):
+                    continue
                 try:
-                    # Escala de grises + autocontraste antes del OCR: mejora
-                    # notablemente la lectura de fechas pequeñas en recibos
-                    # con fondos de color (CFE) y en credenciales oficiales.
-                    # --psm 6 (bloque uniforme de texto) dio mejores
-                    # resultados que el modo automático en todas las pruebas.
-                    imagen_prep = ImageOps.autocontrast(ImageOps.grayscale(imagenes[i]), cutoff=2)
+                    imagen_prep = ImageOps.autocontrast(ImageOps.grayscale(imagenes_hd[i]), cutoff=2)
                     texto_ocr = pytesseract.image_to_string(imagen_prep, lang="spa", config="--psm 6")
                 except Exception as e:
                     texto_ocr = ""
-                    print(f"  [aviso] OCR falló en página {i+1} ({e})", file=sys.stderr)
+                    print(f"  [aviso] OCR (HD) falló en página {i+1} ({e})", file=sys.stderr)
                 if len(texto_ocr.strip()) > len(paginas_texto[i]):
                     paginas_texto[i] = texto_ocr.strip()
                     ocr_usado[i] = True

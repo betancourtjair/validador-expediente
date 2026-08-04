@@ -26,7 +26,9 @@ archivo HTML que se sube a cualquier hosting estático.
 import io
 import os
 import secrets
+import sys
 import tempfile
+import time
 from functools import wraps
 
 from flask import Flask, request, send_file, render_template_string, Response
@@ -166,8 +168,15 @@ def validar():
         if not rutas:
             return "No se recibió ningún documento", 400
 
+        # Log de progreso a stdout: en el plan gratuito de Render el OCR
+        # puede tardar bastante (poco CPU disponible). Sin esto, si algo se
+        # traba no hay ninguna pista en los logs de qué archivo fue.
+        print(f"[validar] iniciando expediente de '{nombre}' con {len(rutas)} documento(s)", file=sys.stderr, flush=True)
+
         filas = []
         for ruta in rutas:
+            t0 = time.time()
+            print(f"[validar]   procesando {os.path.basename(ruta)} ...", file=sys.stderr, flush=True)
             try:
                 fila = ve.procesar_documento(ruta, candidato["nombre"])
             except Exception as e:
@@ -177,6 +186,7 @@ def validar():
                     "legible": False, "texto_muestra": "", "nombre_coincide": None,
                     "detalle": f"Error: {e}",
                 }
+            print(f"[validar]   listo {os.path.basename(ruta)} ({time.time() - t0:.1f}s)", file=sys.stderr, flush=True)
             filas.append(fila)
 
         checklist, extra = ve.construir_reporte(candidato, filas)
@@ -186,6 +196,8 @@ def validar():
 
         with open(salida, "rb") as fh:
             data = fh.read()
+
+        print(f"[validar] expediente de '{nombre}' listo", file=sys.stderr, flush=True)
 
     nombre_archivo = f"expediente_{nombre.strip().replace(' ', '_') or 'candidato'}.xlsx"
     return send_file(
