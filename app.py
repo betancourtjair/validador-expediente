@@ -241,10 +241,10 @@ PAGINA = """
         var buffer = "";
 
         function procesaBuffer() {
-          var bloques = buffer.split("\n\n");
+          var bloques = buffer.split("\\n\\n");
           buffer = bloques.pop();
           bloques.forEach(function (bloque) {
-            bloque.split("\n").forEach(function (linea) {
+            bloque.split("\\n").forEach(function (linea) {
               linea = linea.trim();
               if (linea.indexOf("data:") !== 0) return;
               var jsonTexto = linea.slice(5).trim();
