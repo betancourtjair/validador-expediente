@@ -8,24 +8,41 @@ A diferencia del validador_expediente.html de la primera versión (que corría
 hace OCR y lectura de PDFs en el servidor — eso no se puede hacer de forma
 confiable solo con JavaScript en el navegador para documentos escaneados.
 
+La app está dividida en una página de inicio y 3 secciones (cada una es su
+propia página, no pestañas de JavaScript, para mantenerlo simple):
+
+  /            Inicio: instrucciones en español, sin usuario ni contraseña.
+  /individual  Carga de UN candidato (nombre + RFC + CURP + documentos).
+               Sin usuario ni contraseña. El Excel generado NO se descarga
+               aquí: se guarda para que el equipo de reclutamiento lo
+               descargue después desde /descargas.
+  /lote        Carga masiva por ZIP (hasta 10 candidatos). Solo para el
+               equipo de reclutamiento -pide usuario y contraseña-. El Excel
+               consolidado SÍ se descarga de inmediato aquí, y no se guarda.
+  /descargas   Lista y descarga los expedientes generados por /individual.
+               Solo para el equipo de reclutamiento -pide usuario y
+               contraseña-. Los archivos se eliminan automáticamente a los
+               7 días.
+
 Cómo correrlo
 --------------
-    pip install flask pdfplumber pytesseract pdf2image openpyxl
+    pip install flask pdfplumber pytesseract pdf2image openpyxl google-cloud-storage
     (y en el sistema: tesseract-ocr, tesseract-ocr-spa, poppler-utils)
 
     python3 app.py
 
-Abre http://localhost:5000 en el navegador. Sube los documentos del
-candidato y descarga el Excel del expediente.
+Abre http://localhost:5000 en el navegador.
 
 Para montarlo en tu página web necesitas un hosting que soporte Python
-(Render, Railway, un VPS con Gunicorn + Nginx, etc.) — no es un simple
+(Render, Cloud Run, un VPS con Gunicorn + Nginx, etc.) — no es un simple
 archivo HTML que se sube a cualquier hosting estático.
 """
 
 import base64
+import datetime
 import json
 import os
+import re
 import secrets
 import shutil
 import sys
@@ -40,25 +57,45 @@ import validador_expediente as ve
 app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
-# Usuario y contraseña (protección básica del formulario, vía HTTP Basic Auth)
+# Usuarios autorizados (equipo de reclutamiento), vía HTTP Basic Auth.
 # ---------------------------------------------------------------------------
-# El usuario y la contraseña NO van escritos en el código: se configuran como
-# variables de entorno en el panel de Render (Settings -> Environment).
-# Si no se configuran, se usan estos valores por default SOLO para que la
-# app no truene al desplegarla por primera vez — cámbialos de inmediato en
-# Render con APP_USER y APP_PASSWORD.
-APP_USER = os.environ.get("APP_USER", "reclutamiento")
-APP_PASSWORD = os.environ.get("APP_PASSWORD", "cambia-esta-clave")
+# Se pueden sobrescribir con la variable de entorno APP_USUARIOS, con el
+# formato "correo1:clave1,correo2:clave2,...". Si no se configura nada, se
+# usan estas cuentas (las del equipo de Fitness Para Todos) por default.
+def _cargar_usuarios_autorizados():
+    variable = os.environ.get("APP_USUARIOS", "").strip()
+    usuarios = {}
+    if variable:
+        for par in variable.split(","):
+            par = par.strip()
+            if ":" in par:
+                correo, clave = par.split(":", 1)
+                correo = correo.strip().lower()
+                if correo:
+                    usuarios[correo] = clave
+    if not usuarios:
+        usuarios = {
+            "carlos.diaz@fpt.com.mx": "PlanetFitness$01",
+            "angelica.fuentes@fpt.com.mx": "PlanetFitness$01",
+            "jessica.otamendi@fpt.com.mx": "PlanetFitness$01",
+            "jair@fpt.com.mx": "PlanetFitness$01",
+        }
+    return usuarios
+
+
+USUARIOS_AUTORIZADOS = _cargar_usuarios_autorizados()
 
 
 def requiere_login(f):
     @wraps(f)
     def decorado(*args, **kwargs):
         auth = request.authorization
+        correo = (auth.username or "").strip().lower() if auth else ""
+        clave_esperada = USUARIOS_AUTORIZADOS.get(correo)
         credenciales_ok = (
-            auth
-            and secrets.compare_digest(auth.username or "", APP_USER)
-            and secrets.compare_digest(auth.password or "", APP_PASSWORD)
+            auth is not None
+            and clave_esperada is not None
+            and secrets.compare_digest(auth.password or "", clave_esperada)
         )
         if not credenciales_ok:
             return Response(
@@ -69,6 +106,7 @@ def requiere_login(f):
         return f(*args, **kwargs)
 
     return decorado
+
 
 CAMPOS_DOCUMENTOS = [
     ("cv", "CV", True),
@@ -86,15 +124,127 @@ CAMPOS_DOCUMENTOS = [
     ("constancia_laboral", "Constancia(s) laboral(es)", False),
 ]
 
-PAGINA = """
-<!DOCTYPE html>
-<html lang="es">
-<head>
-<meta charset="UTF-8">
-<title>Validador de Expediente</title>
-<style>
-  body{font-family:Arial,sans-serif;max-width:760px;margin:30px auto;color:#1f2530;}
+# ---------------------------------------------------------------------------
+# Almacenamiento de los expedientes individuales (para la página /descargas)
+# ---------------------------------------------------------------------------
+# En producción (Cloud Run) esto se guarda en un bucket de Google Cloud
+# Storage -indispensable porque Cloud Run puede correr varias instancias (o
+# reiniciar la única que haya) y el disco local NO se comparte entre ellas;
+# si se guardara solo en disco, la página de Documentos a veces "no
+# encontraría" un archivo que sí se generó, según qué instancia atendiera
+# cada petición. El borrado automático a los 7 días se configura como una
+# regla de "lifecycle" del propio bucket (más confiable que borrarlo desde
+# el código: funciona aunque nadie visite la página en varios días).
+#
+# Para desarrollo/pruebas locales (sin GCS_BUCKET_EXPEDIENTES configurada)
+# se cae de vuelta a guardar los archivos en disco, para poder probar todo
+# el flujo sin necesitar credenciales de Google Cloud.
+GCS_BUCKET_EXPEDIENTES = os.environ.get("GCS_BUCKET_EXPEDIENTES", "").strip()
+_cliente_gcs_cache = None
+ALMACEN_LOCAL_DIR = os.path.join(tempfile.gettempdir(), "expedientes_individuales")
+os.makedirs(ALMACEN_LOCAL_DIR, exist_ok=True)
+
+
+def _cliente_gcs():
+    global _cliente_gcs_cache
+    if _cliente_gcs_cache is None:
+        from google.cloud import storage  # import perezoso: no hace falta si no hay bucket configurado
+        _cliente_gcs_cache = storage.Client()
+    return _cliente_gcs_cache
+
+
+def _nombre_archivo_seguro(texto):
+    base = re.sub(r"[^A-Za-z0-9]+", "_", texto or "candidato").strip("_")
+    return (base or "candidato")[:60]
+
+
+def guardar_expediente_individual(ruta_local_xlsx, nombre_candidato):
+    """Guarda el Excel ya generado de un candidato (carga individual) para
+    que el equipo de reclutamiento lo descargue después desde /descargas.
+    Regresa el nombre interno con el que quedó guardado."""
+    marca = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    nombre_interno = f"{marca}_{_nombre_archivo_seguro(nombre_candidato)}.xlsx"
+    if GCS_BUCKET_EXPEDIENTES:
+        bucket = _cliente_gcs().bucket(GCS_BUCKET_EXPEDIENTES)
+        blob = bucket.blob(f"individuales/{nombre_interno}")
+        blob.metadata = {"candidato": nombre_candidato}
+        blob.upload_from_filename(
+            ruta_local_xlsx,
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    else:
+        destino = os.path.join(ALMACEN_LOCAL_DIR, nombre_interno)
+        shutil.copyfile(ruta_local_xlsx, destino)
+        with open(destino + ".meta.json", "w", encoding="utf-8") as fh:
+            json.dump({"candidato": nombre_candidato}, fh, ensure_ascii=False)
+    return nombre_interno
+
+
+def listar_expedientes_individuales():
+    """Regresa la lista de expedientes individuales guardados (más reciente
+    primero), como dicts {nombre_interno, candidato, fecha}."""
+    resultados = []
+    if GCS_BUCKET_EXPEDIENTES:
+        bucket = _cliente_gcs().bucket(GCS_BUCKET_EXPEDIENTES)
+        for blob in bucket.list_blobs(prefix="individuales/"):
+            nombre_interno = blob.name.split("/", 1)[-1]
+            if not nombre_interno:
+                continue
+            candidato = (blob.metadata or {}).get("candidato") or nombre_interno
+            fecha = blob.time_created or datetime.datetime.now(datetime.timezone.utc)
+            resultados.append({"nombre_interno": nombre_interno, "candidato": candidato, "fecha": fecha})
+    else:
+        for nombre_archivo in os.listdir(ALMACEN_LOCAL_DIR):
+            if not nombre_archivo.endswith(".xlsx"):
+                continue
+            ruta = os.path.join(ALMACEN_LOCAL_DIR, nombre_archivo)
+            candidato = nombre_archivo
+            meta_path = ruta + ".meta.json"
+            if os.path.exists(meta_path):
+                try:
+                    with open(meta_path, encoding="utf-8") as fh:
+                        candidato = json.load(fh).get("candidato") or nombre_archivo
+                except Exception:
+                    pass
+            resultados.append({
+                "nombre_interno": nombre_archivo,
+                "candidato": candidato,
+                "fecha": datetime.datetime.fromtimestamp(os.path.getmtime(ruta)),
+            })
+    resultados.sort(key=lambda r: r["fecha"], reverse=True)
+    return resultados
+
+
+def leer_expediente_individual(nombre_interno):
+    """Regresa los bytes del Excel guardado, o None si no existe (ya se
+    borró, o el nombre no es válido)."""
+    if not nombre_interno or "/" in nombre_interno or ".." in nombre_interno or not nombre_interno.endswith(".xlsx"):
+        return None
+    if GCS_BUCKET_EXPEDIENTES:
+        bucket = _cliente_gcs().bucket(GCS_BUCKET_EXPEDIENTES)
+        blob = bucket.blob(f"individuales/{nombre_interno}")
+        if not blob.exists():
+            return None
+        return blob.download_as_bytes()
+    ruta = os.path.join(ALMACEN_LOCAL_DIR, nombre_interno)
+    if not os.path.isfile(ruta):
+        return None
+    with open(ruta, "rb") as fh:
+        return fh.read()
+
+
+# ---------------------------------------------------------------------------
+# HTML compartido: estilos, barra de navegación y el JS de "subir con
+# barra de progreso" que usan tanto /individual como /lote.
+# ---------------------------------------------------------------------------
+ESTILOS = """
+  body{font-family:Arial,sans-serif;max-width:760px;margin:30px auto;color:#1f2530;padding:0 16px;}
   h1{font-size:1.4rem;}
+  h2{font-size:1.15rem;margin-top:0;}
+  nav.tabs{display:flex;gap:6px;margin-bottom:26px;border-bottom:2px solid #e0e0e0;flex-wrap:wrap;}
+  nav.tabs a{padding:10px 14px;text-decoration:none;color:#555;font-weight:600;font-size:.88rem;border-bottom:3px solid transparent;}
+  nav.tabs a.activo{color:#0f6b4c;border-bottom-color:#0f6b4c;}
+  nav.tabs a:hover{color:#0f6b4c;}
   .campo{margin-bottom:14px;}
   label{display:block;font-weight:600;font-size:.85rem;margin-bottom:4px;}
   input[type=text]{width:100%;padding:8px;border:1px solid #ccc;border-radius:6px;}
@@ -103,14 +253,13 @@ PAGINA = """
   .tag{font-size:.7rem;background:#0f6b4c;color:#fff;padding:2px 6px;border-radius:10px;margin-left:6px;}
   button{background:#0f6b4c;color:#fff;border:none;padding:12px 22px;border-radius:8px;font-size:1rem;cursor:pointer;}
   button:disabled{opacity:.6;cursor:not-allowed;}
-  #estado{margin-top:14px;font-size:.9rem;font-weight:600;min-height:1.2em;}
-  #barraContenedor{margin-top:12px;display:none;}
-  progress#barra{width:100%;height:16px;border-radius:8px;overflow:hidden;}
-  progress#barra::-webkit-progress-bar{background:#e6ece9;border-radius:8px;}
-  progress#barra::-webkit-progress-value{background:#0f6b4c;border-radius:8px;transition:width .25s ease;}
-  progress#barra::-moz-progress-bar{background:#0f6b4c;border-radius:8px;}
-  #barraTexto{font-size:.8rem;color:#555;margin-top:4px;}
-  .separador{border:none;border-top:2px solid #e0e0e0;margin:34px 0 22px;}
+  #estado,#estadoLote{margin-top:14px;font-size:.9rem;font-weight:600;min-height:1.2em;}
+  #barraContenedor,#barraContenedorLote{margin-top:12px;display:none;}
+  progress{width:100%;height:16px;border-radius:8px;overflow:hidden;}
+  progress::-webkit-progress-bar{background:#e6ece9;border-radius:8px;}
+  progress::-webkit-progress-value{background:#0f6b4c;border-radius:8px;transition:width .25s ease;}
+  progress::-moz-progress-bar{background:#0f6b4c;border-radius:8px;}
+  #barraTexto,#barraTextoLote{font-size:.8rem;color:#555;margin-top:4px;}
   .pista{background:#f0f8f4;border:1px solid #bfe4d3;border-radius:8px;padding:10px 14px;font-size:.82rem;margin-bottom:16px;line-height:1.5;}
   .pista code{background:#e6ece9;padding:1px 5px;border-radius:4px;}
   .lote-fila{display:flex;gap:10px;align-items:center;border:1px solid #e0e0e0;border-radius:8px;padding:8px 12px;margin-bottom:8px;}
@@ -118,79 +267,62 @@ PAGINA = """
   .lote-fila input[type=text]{flex:1 1 auto;min-width:0;}
   .lote-fila input[type=file]{flex:1 1 auto;min-width:0;font-size:.82rem;}
   #avisoTamanoLote{display:none;background:#fff3cd;border:1px solid #ffe08a;color:#7a5b00;border-radius:8px;padding:10px 14px;font-size:.85rem;margin-bottom:12px;}
-</style>
+  .tarjeta{border:1px solid #e0e0e0;border-radius:10px;padding:16px 18px;margin-bottom:16px;}
+  .tarjeta a.boton{display:inline-block;margin-top:10px;background:#0f6b4c;color:#fff;padding:9px 18px;border-radius:8px;text-decoration:none;font-size:.9rem;font-weight:600;}
+  table.descargas{width:100%;border-collapse:collapse;margin-top:10px;font-size:.88rem;}
+  table.descargas th,table.descargas td{text-align:left;padding:8px 10px;border-bottom:1px solid #e6e6e6;}
+  table.descargas th{color:#555;font-size:.78rem;text-transform:uppercase;letter-spacing:.03em;}
+  .vacio{color:#777;font-size:.9rem;padding:10px 0;}
+  .aviso-info{background:#eef4fb;border:1px solid #cfe0f5;border-radius:8px;padding:10px 14px;font-size:.85rem;margin-bottom:16px;color:#1c4a80;}
+"""
+
+_ENLACES_NAV = [
+    ("inicio", "/", "Inicio"),
+    ("individual", "/individual", "Carga individual"),
+    ("lote", "/lote", "Carga masiva"),
+    ("descargas", "/descargas", "Documentos"),
+]
+
+
+def _nav(activo):
+    piezas = []
+    for clave, url, etiqueta in _ENLACES_NAV:
+        clase = "activo" if clave == activo else ""
+        piezas.append(f'<a href="{url}" class="{clase}">{etiqueta}</a>')
+    return '<nav class="tabs">' + "".join(piezas) + "</nav>"
+
+
+def _envolver_pagina(activo, titulo, cuerpo_html):
+    """Junta el <head>/estilos/nav con el contenido propio de cada página.
+    El resultado todavía puede tener sintaxis de Jinja (p.ej. {{ }} o {% %})
+    heredada de cuerpo_html -eso se procesa después, al pasar el resultado
+    de esta función a render_template_string()-."""
+    return f"""
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{titulo}</title>
+<style>{ESTILOS}</style>
 </head>
 <body>
-<h1>Validador de Expediente de Reclutamiento</h1>
-<form method="post" action="/validar" enctype="multipart/form-data" id="formValidador">
-  <div class="campo">
-    <label>Nombre completo del candidato</label>
-    <input type="text" name="nombre" required>
-  </div>
-  <div class="campo">
-    <label>RFC (opcional)</label>
-    <input type="text" name="rfc">
-  </div>
-  <div class="campo">
-    <label>CURP (opcional)</label>
-    <input type="text" name="curp">
-  </div>
-  {% for campo, etiqueta, obligatorio in documentos %}
-  <div class="doc {{ 'req' if obligatorio else '' }}">
-    <label>{{ etiqueta }} {% if not obligatorio %}<span class="tag">Condicional</span>{% endif %}</label>
-    <input type="file" name="{{ campo }}" accept="application/pdf">
-  </div>
-  {% endfor %}
-  <div class="campo">
-    <label>Otros documentos adicionales (puedes seleccionar varios)</label>
-    <input type="file" name="otros" multiple accept="application/pdf">
-  </div>
-  <button type="submit" id="btnSubmit">Validar y generar Excel</button>
-  <div id="estado"></div>
-  <div id="barraContenedor">
-    <progress id="barra" value="0" max="1"></progress>
-    <div id="barraTexto"></div>
-  </div>
-</form>
+{_nav(activo)}
+{cuerpo_html}
+</body>
+</html>
+"""
 
-<hr class="separador">
 
-<h1>Carga masiva por ZIP (hasta 10 candidatos)</h1>
-<div class="pista">
-  Sube <strong>un archivo ZIP por candidato</strong>, con los PDFs de ese candidato
-  adentro. El sistema identifica cada documento por el <strong>nombre del archivo</strong>
-  dentro del ZIP (no hace falta acomodarlos en campos como arriba). Nombra los PDFs
-  así (mayúsculas/minúsculas y guiones no importan):
-  <br><br>
-  {% for campo, etiqueta, obligatorio in documentos %}<code>{{ campo }}.pdf</code>{% if not loop.last %}, {% endif %}{% endfor %},
-  y cualquier otro documento con el nombre que quieras (se reporta como "otros" o se
-  intenta reconocer por su contenido).
-  <br><br>
-  Límite: 10 candidatos por tanda y <strong>~28&nbsp;MB en total</strong> entre todos los
-  ZIP juntos (límite de la plataforma) — si pesan más, sube los candidatos en 2 tandas.
-</div>
-<div id="avisoTamanoLote"></div>
-<form method="post" action="/validar_lote" enctype="multipart/form-data" id="formLote">
-  {% for i in range(1, 11) %}
-  <div class="lote-fila">
-    <div class="num">{{ i }}.</div>
-    <input type="text" name="nombre_{{ i }}" placeholder="Nombre completo del candidato {{ i }}">
-    <input type="file" name="zip_{{ i }}" accept=".zip,application/zip">
-  </div>
-  {% endfor %}
-  <button type="submit" id="btnSubmitLote">Procesar candidatos (ZIP)</button>
-  <div id="estadoLote"></div>
-  <div id="barraContenedorLote">
-    <progress id="barraLote" value="0" max="1"></progress>
-    <div id="barraTextoLote"></div>
-  </div>
-</form>
-
+# El "núcleo" de JS (la función configurarFormularioConProgreso) es igual
+# para /individual y /lote, así que se define una sola vez aquí y cada
+# página solo agrega su propia llamada de configuración.
+JS_NUCLEO = """
 <script>
-// Ambos formularios (un candidato / carga masiva por ZIP) se mandan por
-// fetch (en vez de un submit normal) para poder limpiarlos por completo
-// -incluyendo los archivos ya seleccionados- justo después de descargar el
-// Excel, y para poder mostrar una barra de progreso en vivo.
+// Los formularios se mandan por fetch (en vez de un submit normal) para
+// poder limpiarlos por completo -incluyendo los archivos ya seleccionados-
+// justo después de terminar, y para poder mostrar una barra de progreso en
+// vivo.
 //
 // El servidor va mandando el avance real (documento por documento, o
 // candidato por candidato en la carga masiva) como un "stream" de eventos
@@ -201,8 +333,9 @@ PAGINA = """
 // podría congelar el CPU del contenedor entre una consulta y otra).
 //
 // configurarFormularioConProgreso() cablea un formulario con su barra de
-// progreso; se usa una vez por formulario (abajo) para no repetir esta
-// lógica dos veces.
+// progreso. opciones.descargar controla si al terminar se debe disparar la
+// descarga del Excel en el navegador (carga masiva) o no (carga
+// individual, donde el Excel solo se guarda en el servidor).
 function configurarFormularioConProgreso(opciones) {
   var form = document.getElementById(opciones.formId);
   var boton = document.getElementById(opciones.botonId);
@@ -239,19 +372,21 @@ function configurarFormularioConProgreso(opciones) {
     } else if (info.tipo === "listo") {
       barra.value = barra.max;
       barraTexto.textContent = "100%";
-      var blob = base64ABlob(info.datos_base64, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-      var url = window.URL.createObjectURL(blob);
-      var a = document.createElement("a");
-      a.href = url;
-      a.download = info.nombre_archivo || "expediente.xlsx";
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      window.URL.revokeObjectURL(url);
+      if (opciones.descargar !== false && info.datos_base64) {
+        var blob = base64ABlob(info.datos_base64, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+        var url = window.URL.createObjectURL(blob);
+        var a = document.createElement("a");
+        a.href = url;
+        a.download = info.nombre_archivo || "expediente.xlsx";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        window.URL.revokeObjectURL(url);
+      }
 
-      // Limpia todos los campos y archivos seleccionados.
+      // Limpia todos los campos y archivos seleccionados para la siguiente carga.
       form.reset();
-      terminar("Listo: se descargó " + (info.nombre_archivo || "expediente.xlsx") + ". El formulario ya está limpio para la siguiente carga.", false);
+      terminar(info.mensaje || ("Listo: se descargó " + (info.nombre_archivo || "expediente.xlsx") + ". El formulario ya está limpio para la siguiente carga."), false);
     } else if (info.tipo === "error") {
       terminar("Ocurrió un error generando el expediente: " + (info.error || "error desconocido") + " (no se borró nada, puedes reintentar).", true);
     }
@@ -337,7 +472,96 @@ function configurarFormularioConProgreso(opciones) {
       });
   });
 }
+</script>
+"""
 
+
+# ---------------------------------------------------------------------------
+# Página de inicio (/) — solo instrucciones, sin usuario ni contraseña.
+# ---------------------------------------------------------------------------
+CONTENIDO_INICIO = """
+<h1>Validador de Expediente — Fitness Para Todos</h1>
+<p>Esta herramienta revisa que el expediente de un candidato esté completo:
+lee los documentos en PDF (incluso escaneados, usando OCR) y genera un
+Excel con el resultado.</p>
+
+<div class="tarjeta">
+  <h2>1. Carga individual (para el candidato)</h2>
+  <p>El candidato sube sus documentos uno por uno (CV, INE, comprobante de
+  domicilio, etc.) junto con su nombre, RFC y CURP. <strong>No se necesita
+  usuario ni contraseña.</strong></p>
+  <p>Al terminar, el Excel del expediente se guarda automáticamente — el
+  candidato NO lo descarga. El equipo de reclutamiento lo descarga después
+  desde <strong>Documentos</strong>. El formulario queda listo de inmediato
+  para el siguiente candidato.</p>
+  <a class="boton" href="/individual">Ir a carga individual</a>
+</div>
+
+<div class="tarjeta">
+  <h2>2. Carga masiva por ZIP (equipo de reclutamiento)</h2>
+  <p>Permite subir hasta <strong>10 candidatos a la vez</strong>: un archivo
+  ZIP por candidato, con sus documentos en PDF adentro nombrados según la
+  convención (cv.pdf, ine.pdf, comprobante_domicilio.pdf, etc. — se explica
+  con más detalle en esa página). <strong>Requiere iniciar sesión.</strong></p>
+  <p>Al terminar se descarga de inmediato un solo Excel con una hoja por
+  cada candidato del lote.</p>
+  <a class="boton" href="/lote">Ir a carga masiva</a>
+</div>
+
+<div class="tarjeta">
+  <h2>3. Documentos (equipo de reclutamiento)</h2>
+  <p>Aquí se descargan los expedientes en Excel generados por la
+  <strong>carga individual</strong> de los candidatos. <strong>Requiere
+  iniciar sesión.</strong></p>
+  <p>Los archivos se eliminan automáticamente 7 días después de haberse
+  generado.</p>
+  <a class="boton" href="/descargas">Ir a documentos</a>
+</div>
+"""
+
+
+# ---------------------------------------------------------------------------
+# Carga individual (/individual, /validar) — sin usuario ni contraseña.
+# ---------------------------------------------------------------------------
+CONTENIDO_INDIVIDUAL = """
+<h1>Carga individual de documentos</h1>
+<div class="aviso-info">
+  Sube tus documentos en PDF. Al terminar, tu expediente queda guardado
+  para que el equipo de reclutamiento lo revise — no se descarga nada en
+  este paso.
+</div>
+<form method="post" action="/validar" enctype="multipart/form-data" id="formValidador">
+  <div class="campo">
+    <label>Nombre completo del candidato</label>
+    <input type="text" name="nombre" required>
+  </div>
+  <div class="campo">
+    <label>RFC (opcional)</label>
+    <input type="text" name="rfc">
+  </div>
+  <div class="campo">
+    <label>CURP (opcional)</label>
+    <input type="text" name="curp">
+  </div>
+  {% for campo, etiqueta, obligatorio in documentos %}
+  <div class="doc {{ 'req' if obligatorio else '' }}">
+    <label>{{ etiqueta }} {% if not obligatorio %}<span class="tag">Condicional</span>{% endif %}</label>
+    <input type="file" name="{{ campo }}" accept="application/pdf">
+  </div>
+  {% endfor %}
+  <div class="campo">
+    <label>Otros documentos adicionales (puedes seleccionar varios)</label>
+    <input type="file" name="otros" multiple accept="application/pdf">
+  </div>
+  <button type="submit" id="btnSubmit">Enviar documentos</button>
+  <div id="estado"></div>
+  <div id="barraContenedor">
+    <progress id="barra" value="0" max="1"></progress>
+    <div id="barraTexto"></div>
+  </div>
+</form>
+""" + JS_NUCLEO + """
+<script>
 configurarFormularioConProgreso({
   formId: "formValidador",
   botonId: "btnSubmit",
@@ -346,8 +570,48 @@ configurarFormularioConProgreso({
   barraId: "barra",
   barraTextoId: "barraTexto",
   mensajeInicial: "Procesando documentos (puede tardar uno o dos minutos)...",
+  descargar: false,
 });
+</script>
+"""
 
+
+# ---------------------------------------------------------------------------
+# Carga masiva por ZIP (/lote, /validar_lote) — requiere iniciar sesión.
+# ---------------------------------------------------------------------------
+CONTENIDO_LOTE = """
+<h1>Carga masiva por ZIP (hasta 10 candidatos)</h1>
+<div class="pista">
+  Sube <strong>un archivo ZIP por candidato</strong>, con los PDFs de ese candidato
+  adentro. El sistema identifica cada documento por el <strong>nombre del archivo</strong>
+  dentro del ZIP (no hace falta acomodarlos en campos separados). Nombra los PDFs
+  así (mayúsculas/minúsculas y guiones no importan):
+  <br><br>
+  {% for campo, etiqueta, obligatorio in documentos %}<code>{{ campo }}.pdf</code>{% if not loop.last %}, {% endif %}{% endfor %},
+  y cualquier otro documento con el nombre que quieras (se reporta como "otros" o se
+  intenta reconocer por su contenido).
+  <br><br>
+  Límite: 10 candidatos por tanda y <strong>~28&nbsp;MB en total</strong> entre todos los
+  ZIP juntos (límite de la plataforma) — si pesan más, sube los candidatos en 2 tandas.
+</div>
+<div id="avisoTamanoLote"></div>
+<form method="post" action="/validar_lote" enctype="multipart/form-data" id="formLote">
+  {% for i in range(1, 11) %}
+  <div class="lote-fila">
+    <div class="num">{{ i }}.</div>
+    <input type="text" name="nombre_{{ i }}" placeholder="Nombre completo del candidato {{ i }}">
+    <input type="file" name="zip_{{ i }}" accept=".zip,application/zip">
+  </div>
+  {% endfor %}
+  <button type="submit" id="btnSubmitLote">Procesar candidatos (ZIP)</button>
+  <div id="estadoLote"></div>
+  <div id="barraContenedorLote">
+    <progress id="barraLote" value="0" max="1"></progress>
+    <div id="barraTextoLote"></div>
+  </div>
+</form>
+""" + JS_NUCLEO + """
+<script>
 // Límite de la plataforma (Cloud Run) para el tamaño de una sola petición
 // HTTP: ~32 MiB. Se deja un margen (28 MB) para los demás campos del
 // formulario y la sobrecarga propia de multipart/form-data. Si se detecta
@@ -392,15 +656,82 @@ configurarFormularioConProgreso({
   },
 });
 </script>
-</body>
-</html>
+"""
+
+
+# ---------------------------------------------------------------------------
+# Documentos (/descargas) — requiere iniciar sesión.
+# ---------------------------------------------------------------------------
+CONTENIDO_DESCARGAS = """
+<h1>Documentos — expedientes individuales</h1>
+<div class="aviso-info">
+  Aquí se descargan los expedientes en Excel generados por la <strong>carga
+  individual</strong> de candidatos. Se eliminan automáticamente 7 días
+  después de haberse generado.
+</div>
+<table class="descargas">
+  <thead><tr><th>Candidato</th><th>Generado</th><th></th></tr></thead>
+  <tbody>
+  {% for archivo in archivos %}
+    <tr>
+      <td>{{ archivo.candidato }}</td>
+      <td>{{ archivo.fecha_texto }}</td>
+      <td><a href="/descargas/archivo/{{ archivo.nombre_interno }}">Descargar</a></td>
+    </tr>
+  {% else %}
+    <tr><td colspan="3" class="vacio">Todavía no hay expedientes individuales guardados.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
 """
 
 
 @app.route("/", methods=["GET"])
+def inicio():
+    return render_template_string(_envolver_pagina("inicio", "Validador de Expediente — Fitness Para Todos", CONTENIDO_INICIO))
+
+
+@app.route("/individual", methods=["GET"])
+def formulario_individual():
+    return render_template_string(
+        _envolver_pagina("individual", "Carga individual — Validador de Expediente", CONTENIDO_INDIVIDUAL),
+        documentos=CAMPOS_DOCUMENTOS,
+    )
+
+
+@app.route("/lote", methods=["GET"])
 @requiere_login
-def index():
-    return render_template_string(PAGINA, documentos=CAMPOS_DOCUMENTOS)
+def formulario_lote():
+    return render_template_string(
+        _envolver_pagina("lote", "Carga masiva — Validador de Expediente", CONTENIDO_LOTE),
+        documentos=CAMPOS_DOCUMENTOS,
+    )
+
+
+@app.route("/descargas", methods=["GET"])
+@requiere_login
+def descargas():
+    archivos = listar_expedientes_individuales()
+    for item in archivos:
+        fecha = item.get("fecha")
+        item["fecha_texto"] = fecha.strftime("%d/%m/%Y %H:%M") if hasattr(fecha, "strftime") else str(fecha)
+    return render_template_string(
+        _envolver_pagina("descargas", "Documentos — Validador de Expediente", CONTENIDO_DESCARGAS),
+        archivos=archivos,
+    )
+
+
+@app.route("/descargas/archivo/<nombre_interno>", methods=["GET"])
+@requiere_login
+def descargar_archivo(nombre_interno):
+    datos = leer_expediente_individual(nombre_interno)
+    if datos is None:
+        return "Archivo no encontrado (puede que ya se haya eliminado automáticamente después de 7 días).", 404
+    return Response(
+        datos,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{nombre_interno}"'},
+    )
 
 
 def _evento_sse(datos_dict):
@@ -419,6 +750,12 @@ def _generar_eventos_validacion(tmp, rutas, candidato):
     seguidor corriera "detrás" en un hilo después de haber contestado ya la
     petición, se podría quedar sin CPU y tardar muchísimo más (o nunca
     terminar) hasta que llegara otra petición.
+
+    A diferencia de antes, al terminar NO se manda el Excel de vuelta al
+    navegador: se guarda con guardar_expediente_individual() para que el
+    equipo de reclutamiento lo descargue después desde /descargas -este
+    formulario es público (sin usuario/contraseña), así que no tiene sentido
+    que el candidato se quede con una copia del archivo.
 
     Al terminar (bien o mal) borra el directorio temporal con los PDFs
     subidos, igual que antes hacía `tempfile.TemporaryDirectory()` — nomás
@@ -458,17 +795,18 @@ def _generar_eventos_validacion(tmp, rutas, candidato):
         salida = os.path.join(tmp, "expediente.xlsx")
         ve.generar_excel(candidato, filas, checklist, extra, salida)
 
-        with open(salida, "rb") as fh:
-            data = fh.read()
+        nombre_interno = guardar_expediente_individual(salida, nombre)
+        print(f"[validar] expediente de '{nombre}' guardado como '{nombre_interno}'", file=sys.stderr, flush=True)
 
         hecho = total
-        nombre_archivo = f"expediente_{nombre.strip().replace(' ', '_') or 'candidato'}.xlsx"
         yield _evento_sse({
             "tipo": "listo",
             "hecho": hecho,
             "total": total,
-            "nombre_archivo": nombre_archivo,
-            "datos_base64": base64.b64encode(data).decode("ascii"),
+            "mensaje": (
+                f"Listo: se recibió el expediente de {nombre}. Ya puedes cerrar esta página; "
+                "el equipo de reclutamiento lo revisará. El formulario está listo para el siguiente candidato."
+            ),
         })
 
         print(f"[validar] expediente de '{nombre}' listo", file=sys.stderr, flush=True)
@@ -483,7 +821,6 @@ def _generar_eventos_validacion(tmp, rutas, candidato):
 
 
 @app.route("/validar", methods=["POST"])
-@requiere_login
 def validar():
     nombre = request.form.get("nombre", "").strip()
     rfc = request.form.get("rfc", "").strip()
