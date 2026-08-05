@@ -237,43 +237,59 @@ def leer_expediente_individual(nombre_interno):
 # HTML compartido: estilos, barra de navegación y el JS de "subir con
 # barra de progreso" que usan tanto /individual como /lote.
 # ---------------------------------------------------------------------------
+# Esto retoma el "look and feel" del sitio https://fpt.com.mx/ (morado de
+# marca #592c82, morado oscuro #3c1053 en la barra superior, logo en blanco,
+# tipografía Barlow Condensed en encabezados y Open Sans en el resto).
 ESTILOS = """
-  body{font-family:Arial,sans-serif;max-width:760px;margin:30px auto;color:#1f2530;padding:0 16px;}
-  h1{font-size:1.4rem;}
-  h2{font-size:1.15rem;margin-top:0;}
-  nav.tabs{display:flex;gap:6px;margin-bottom:26px;border-bottom:2px solid #e0e0e0;flex-wrap:wrap;}
-  nav.tabs a{padding:10px 14px;text-decoration:none;color:#555;font-weight:600;font-size:.88rem;border-bottom:3px solid transparent;}
-  nav.tabs a.activo{color:#0f6b4c;border-bottom-color:#0f6b4c;}
-  nav.tabs a:hover{color:#0f6b4c;}
+  :root{--fpt-morado:#592c82;--fpt-morado-oscuro:#3c1053;}
+  *{box-sizing:border-box;}
+  body{font-family:"Open Sans",Arial,sans-serif;margin:0;color:#333333;background:#ffffff;}
+  h1,h2{font-family:"Barlow Condensed","Arial Narrow",Arial,sans-serif;font-weight:700;color:var(--fpt-morado);}
+  h1{font-size:1.9rem;margin-top:0;letter-spacing:.01em;}
+  h2{font-size:1.35rem;margin-top:0;}
+  a{color:var(--fpt-morado);}
+  .contenido{max-width:760px;margin:0 auto;padding:30px 16px 40px;}
+  .fpt-header{background:var(--fpt-morado-oscuro);display:flex;align-items:center;flex-wrap:wrap;gap:18px;padding:10px 20px;position:sticky;top:0;z-index:10;}
+  .fpt-logo{display:flex;align-items:center;padding-right:18px;border-right:1px solid rgba(255,255,255,.25);}
+  .fpt-logo img{display:block;height:40px;width:auto;}
+  nav.tabs{display:flex;gap:2px;flex-wrap:wrap;}
+  nav.tabs a{padding:10px 14px;text-decoration:none;color:#fff;font-weight:600;font-size:.82rem;text-transform:uppercase;letter-spacing:.03em;border-bottom:3px solid transparent;opacity:.85;}
+  nav.tabs a.activo{opacity:1;border-bottom-color:#fff;}
+  nav.tabs a:hover{opacity:1;}
   .campo{margin-bottom:14px;}
-  label{display:block;font-weight:600;font-size:.85rem;margin-bottom:4px;}
-  input[type=text]{width:100%;padding:8px;border:1px solid #ccc;border-radius:6px;}
+  label{display:block;font-weight:600;font-size:.85rem;margin-bottom:4px;color:#333;}
+  input[type=text]{width:100%;padding:8px;border:1px solid #ccc;border-radius:6px;font-family:inherit;}
+  input[type=text]:focus{outline:none;border-color:var(--fpt-morado);box-shadow:0 0 0 2px rgba(89,44,130,.15);}
   .doc{border:1px solid #e0e0e0;border-radius:8px;padding:10px 14px;margin-bottom:8px;}
-  .doc.req{background:#f0f8f4;border-color:#bfe4d3;}
-  .tag{font-size:.7rem;background:#0f6b4c;color:#fff;padding:2px 6px;border-radius:10px;margin-left:6px;}
-  button{background:#0f6b4c;color:#fff;border:none;padding:12px 22px;border-radius:8px;font-size:1rem;cursor:pointer;}
+  .doc.req{background:#f5f0fa;border-color:#d9c7ec;}
+  .tag{font-size:.7rem;background:var(--fpt-morado);color:#fff;padding:2px 6px;border-radius:10px;margin-left:6px;}
+  .oculto{display:none;}
+  button{background:var(--fpt-morado);color:#fff;border:none;padding:12px 22px;border-radius:8px;font-size:1rem;font-weight:600;cursor:pointer;font-family:inherit;}
+  button:hover:not(:disabled){background:var(--fpt-morado-oscuro);}
   button:disabled{opacity:.6;cursor:not-allowed;}
   #estado,#estadoLote{margin-top:14px;font-size:.9rem;font-weight:600;min-height:1.2em;}
   #barraContenedor,#barraContenedorLote{margin-top:12px;display:none;}
   progress{width:100%;height:16px;border-radius:8px;overflow:hidden;}
-  progress::-webkit-progress-bar{background:#e6ece9;border-radius:8px;}
-  progress::-webkit-progress-value{background:#0f6b4c;border-radius:8px;transition:width .25s ease;}
-  progress::-moz-progress-bar{background:#0f6b4c;border-radius:8px;}
+  progress::-webkit-progress-bar{background:#ece4f3;border-radius:8px;}
+  progress::-webkit-progress-value{background:var(--fpt-morado);border-radius:8px;transition:width .25s ease;}
+  progress::-moz-progress-bar{background:var(--fpt-morado);border-radius:8px;}
   #barraTexto,#barraTextoLote{font-size:.8rem;color:#555;margin-top:4px;}
-  .pista{background:#f0f8f4;border:1px solid #bfe4d3;border-radius:8px;padding:10px 14px;font-size:.82rem;margin-bottom:16px;line-height:1.5;}
-  .pista code{background:#e6ece9;padding:1px 5px;border-radius:4px;}
+  .pista{background:#f5f0fa;border:1px solid #d9c7ec;border-radius:8px;padding:10px 14px;font-size:.82rem;margin-bottom:16px;line-height:1.5;color:#3c1053;}
+  .pista code{background:#e4d7ef;padding:1px 5px;border-radius:4px;}
   .lote-fila{display:flex;gap:10px;align-items:center;border:1px solid #e0e0e0;border-radius:8px;padding:8px 12px;margin-bottom:8px;}
   .lote-fila .num{font-weight:600;font-size:.85rem;color:#555;width:22px;flex:none;}
   .lote-fila input[type=text]{flex:1 1 auto;min-width:0;}
   .lote-fila input[type=file]{flex:1 1 auto;min-width:0;font-size:.82rem;}
   #avisoTamanoLote{display:none;background:#fff3cd;border:1px solid #ffe08a;color:#7a5b00;border-radius:8px;padding:10px 14px;font-size:.85rem;margin-bottom:12px;}
   .tarjeta{border:1px solid #e0e0e0;border-radius:10px;padding:16px 18px;margin-bottom:16px;}
-  .tarjeta a.boton{display:inline-block;margin-top:10px;background:#0f6b4c;color:#fff;padding:9px 18px;border-radius:8px;text-decoration:none;font-size:.9rem;font-weight:600;}
+  .tarjeta a.boton{display:inline-block;margin-top:10px;background:var(--fpt-morado);color:#fff;padding:9px 18px;border-radius:8px;text-decoration:none;font-size:.9rem;font-weight:600;}
+  .tarjeta a.boton:hover{background:var(--fpt-morado-oscuro);}
   table.descargas{width:100%;border-collapse:collapse;margin-top:10px;font-size:.88rem;}
   table.descargas th,table.descargas td{text-align:left;padding:8px 10px;border-bottom:1px solid #e6e6e6;}
   table.descargas th{color:#555;font-size:.78rem;text-transform:uppercase;letter-spacing:.03em;}
+  table.descargas a{font-weight:600;}
   .vacio{color:#777;font-size:.9rem;padding:10px 0;}
-  .aviso-info{background:#eef4fb;border:1px solid #cfe0f5;border-radius:8px;padding:10px 14px;font-size:.85rem;margin-bottom:16px;color:#1c4a80;}
+  .aviso-info{background:#f5f0fa;border:1px solid #d9c7ec;border-radius:8px;padding:10px 14px;font-size:.85rem;margin-bottom:16px;color:#3c1053;}
 """
 
 _ENLACES_NAV = [
@@ -282,6 +298,10 @@ _ENLACES_NAV = [
     ("lote", "/lote", "Carga masiva"),
     ("descargas", "/descargas", "Documentos"),
 ]
+
+# Logo oficial (versión blanca, pensada para fondo morado oscuro) tomado
+# directamente de https://fpt.com.mx/ para mantener el mismo look and feel.
+_LOGO_FPT_URL = "https://fpt.com.mx/img/fpt-logo-blanco.png"
 
 
 def _nav(activo):
@@ -304,11 +324,19 @@ def _envolver_pagina(activo, titulo, cuerpo_html):
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{titulo}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&family=Open+Sans:wght@400;600;700&display=swap" rel="stylesheet">
 <style>{ESTILOS}</style>
 </head>
 <body>
-{_nav(activo)}
+<header class="fpt-header">
+  <a href="/" class="fpt-logo"><img src="{_LOGO_FPT_URL}" alt="Fitness Para Todos"></a>
+  {_nav(activo)}
+</header>
+<main class="contenido">
 {cuerpo_html}
+</main>
 </body>
 </html>
 """
@@ -545,11 +573,16 @@ CONTENIDO_INDIVIDUAL = """
   </div>
   {% for campo, etiqueta, obligatorio in documentos %}
   <div class="doc {{ 'req' if obligatorio else '' }}">
-    <label>{{ etiqueta }} {% if not obligatorio %}<span class="tag">Condicional</span>{% endif %}</label>
+    <label>{{ etiqueta }} {% if not obligatorio %}<span class="tag">Opcional</span>{% endif %}</label>
     <input type="file" name="{{ campo }}" accept="application/pdf">
   </div>
   {% endfor %}
-  <div class="campo">
+  <!-- "Otros documentos adicionales" oculto a petición del equipo de FPT
+       (2026-08-05). El campo sigue existiendo en el formulario -por si se
+       vuelve a necesitar solo hace falta quitar la clase "oculto"-, pero no
+       se manda nada en este campo mientras esté oculto porque no hay forma
+       de seleccionar archivos. -->
+  <div class="campo oculto">
     <label>Otros documentos adicionales (puedes seleccionar varios)</label>
     <input type="file" name="otros" multiple accept="application/pdf">
   </div>
