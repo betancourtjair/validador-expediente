@@ -186,7 +186,7 @@ PAGINA = """
       barra.max = info.total || 1;
       barra.value = info.hecho || 0;
       var porcentaje = Math.round(100 * (info.hecho || 0) / (info.total || 1));
-      barraTexto.textContent = porcentaje + "% — " + (info.archivo_actual || "Procesando...");
+      barraTexto.textContent = porcentaje + "% - " + (info.archivo_actual || "Procesando...");
     } else if (info.tipo === "listo") {
       barra.value = barra.max;
       barraTexto.textContent = "100%";
