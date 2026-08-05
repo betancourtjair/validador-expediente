@@ -27,7 +27,9 @@ EXPOSE 10000
 
 # 1 solo worker (el plan gratuito de Render trae solo 512 MB / 0.1 CPU; dos
 # workers corriendo OCR al mismo tiempo se quedarían sin memoria) y timeout
-# largo (10 min): con varios documentos escaneados en un mismo expediente,
+# largo (30 min): con varios documentos escaneados en un mismo expediente,
 # el OCR puede tardar bastante más en este tipo de instancia que en una
-# máquina de desarrollo normal.
-CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT} --workers 1 --timeout 600 app:app"]
+# máquina de desarrollo normal, y la carga masiva (/validar_lote) puede
+# procesar hasta 10 candidatos en una sola petición — hay que dejarle
+# tiempo de sobra a gunicorn para que no corte la conexión a la mitad.
+CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT} --workers 1 --timeout 1800 app:app"]

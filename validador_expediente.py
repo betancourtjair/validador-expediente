@@ -70,6 +70,7 @@ import os
 import re
 import sys
 import unicodedata
+import zipfile
 
 import pdfplumber
 from pdf2image import convert_from_path
@@ -454,6 +455,69 @@ def clasificar(texto_completo, nombre_archivo):
 
 
 # ---------------------------------------------------------------------------
+# Carga masiva por ZIP: convención de nombres de archivo
+# ---------------------------------------------------------------------------
+# Para la carga masiva (un ZIP por candidato) el sistema identifica cada
+# documento por el NOMBRE del archivo dentro del ZIP, en vez de tener que
+# adivinarlo por el contenido — así el resultado es predecible y no depende
+# de qué tan bien se leyó el OCR. Cada clave de CATEGORIAS tiene una lista de
+# "alias" (palabras que se buscan como token completo, o como subcadena si el
+# alias ya trae guion bajo) dentro del nombre del archivo ya normalizado
+# (minúsculas, sin acentos, cualquier separador -espacio, guion, punto-
+# convertido a "_"). Ejemplos de nombres que SÍ matchean:
+#   cv.pdf, CV_Juan.pdf, 01-cv.pdf, curriculum.pdf, comprobante_domicilio.pdf,
+#   Comprobante-Domicilio (2).pdf, domicilio.pdf, ine.pdf, INE_frente_reverso.pdf
+# Si el nombre del archivo no matchea ningún alias, se cae al reconocimiento
+# por CONTENIDO (la misma lógica que ya usa la carga de un candidato a la
+# vez) y, si tampoco así se identifica, el documento se reporta como
+# "Desconocido / no identificado" (equivalente a la carpeta "otros").
+ALIAS_ARCHIVO = {
+    "CV": ["cv", "curriculum", "resume"],
+    "ACTA_NACIMIENTO": ["acta_nacimiento", "acta"],
+    "INE": ["ine", "ife", "credencial"],
+    "COMPROBANTE_DOMICILIO": ["comprobante_domicilio", "domicilio", "recibo_luz", "recibo_agua", "recibo_cfe", "cfe", "comprobante"],
+    "COMPROBANTE_ESTUDIOS": ["comprobante_estudios", "estudios", "titulo", "cedula_profesional", "certificado_estudios"],
+    "CURP": ["curp"],
+    "CSF": ["csf", "constancia_situacion_fiscal", "situacion_fiscal", "fiscal"],
+    "NSS": ["nss", "seguridad_social", "imss"],
+    "CUENTA_BANCARIA": ["cuenta_bancaria", "cuenta", "caratula_bancaria", "caratula", "clabe", "estado_cuenta"],
+    "INFONAVIT_FONACOT": ["infonavit_fonacot", "infonavit", "fonacot"],
+    "CERTIFICADO_MEDICO": ["certificado_medico", "medico"],
+    "CERTIFICADO_INSTRUCTOR": ["certificado_instructor", "certificado_entrenador", "entrenador", "barbero", "estilista", "coach"],
+    "CONSTANCIA_LABORAL": ["constancia_laboral", "carta_laboral", "laboral", "referencia_laboral"],
+}
+
+# orden en el que se revisan los alias: los más largos/específicos primero,
+# para que "comprobante_domicilio" gane sobre el genérico "comprobante" si
+# ambos aparecen en el nombre del archivo.
+_ALIAS_ORDENADOS = sorted(
+    ((clave, alias) for clave, alias_list in ALIAS_ARCHIVO.items() for alias in alias_list),
+    key=lambda par: -len(par[1]),
+)
+
+
+def _normaliza_nombre_archivo(nombre_archivo):
+    """minúsculas, sin acentos, sin extensión, separadores -> '_' """
+    base = os.path.splitext(os.path.basename(nombre_archivo))[0]
+    base = unicodedata.normalize("NFKD", base).encode("ascii", "ignore").decode("ascii")
+    base = base.lower()
+    base = re.sub(r"[^a-z0-9]+", "_", base).strip("_")
+    return base
+
+
+def detectar_categoria_por_nombre_archivo(nombre_archivo):
+    """Regresa la clave de CATEGORIAS sugerida por el NOMBRE del archivo
+    (convención de la carga masiva por ZIP), o None si el nombre no da
+    ninguna pista clara (en ese caso el caller debe caer al reconocimiento
+    por contenido, ver clasificar())."""
+    base = "_" + _normaliza_nombre_archivo(nombre_archivo) + "_"
+    for clave, alias in _ALIAS_ORDENADOS:
+        if ("_" + alias + "_") in base:
+            return clave
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Nombre: extracción y comparación
 # ---------------------------------------------------------------------------
 
@@ -738,12 +802,18 @@ def analiza_comprobante_domicilio(texto_completo):
 # Procesamiento principal
 # ---------------------------------------------------------------------------
 
-def procesar_documento(ruta, nombre_candidato):
+def procesar_documento(ruta, nombre_candidato, categoria_forzada=None):
+    """Si se da categoria_forzada (clave de CATEGORIAS), se usa esa
+    categoría directamente en vez de intentar reconocerla por contenido —
+    esto es lo que usa la carga masiva por ZIP, donde la categoría ya viene
+    determinada por el NOMBRE del archivo (ver
+    detectar_categoria_por_nombre_archivo). La carga de un candidato a la
+    vez sigue funcionando igual que siempre (sin categoria_forzada)."""
     nombre_archivo = os.path.basename(ruta)
     paginas_texto, num_paginas, ocr_usado = extraer_texto_pdf(ruta)
     texto_completo = "\n".join(paginas_texto)
     legible = any(len(p.strip()) >= 20 for p in paginas_texto)
-    clave = clasificar(texto_completo, nombre_archivo)
+    clave = categoria_forzada or clasificar(texto_completo, nombre_archivo)
     nombre_legible, _, _ = CATEGORIAS.get(clave, ("Desconocido / no identificado", [], False))
 
     fila = {
@@ -819,6 +889,69 @@ def procesar_documento(ruta, nombre_candidato):
     return fila
 
 
+# ---------------------------------------------------------------------------
+# Carga masiva por ZIP: extracción y procesamiento de un candidato
+# ---------------------------------------------------------------------------
+
+def _es_pdf_valido_en_zip(nombre_interno):
+    """Filtra basura común de los ZIPs: carpetas, archivos ocultos
+    (._archivo.pdf que crea macOS al comprimir) y la carpeta __MACOSX."""
+    if nombre_interno.endswith("/"):
+        return False
+    base = os.path.basename(nombre_interno)
+    if not base or base.startswith("."):
+        return False
+    if "__MACOSX" in nombre_interno:
+        return False
+    return base.lower().endswith(".pdf")
+
+
+def listar_pdfs_en_zip(ruta_zip):
+    """Regresa la lista de nombres internos (rutas dentro del ZIP) que son
+    PDFs a procesar. Si el ZIP viene corrupto o no es un ZIP real, deja
+    que zipfile.BadZipFile se propague — el caller lo captura para reportar
+    ese candidato en particular como error, sin tronar el resto del lote."""
+    with zipfile.ZipFile(ruta_zip) as zf:
+        return [n for n in zf.namelist() if _es_pdf_valido_en_zip(n)]
+
+
+def procesar_zip_candidato_progresivo(ruta_zip, nombre_candidato, dir_extraccion, nombres_pdf=None):
+    """Generador: extrae y procesa cada PDF de un ZIP de un candidato.
+
+    Cede (yield) el nombre del archivo justo antes de procesarlo —así quien
+    lo consuma con un bucle 'for'/'next()' puede reportar avance en vivo
+    (ver /validar_lote en app.py, que lo usa con 'yield from' dentro de su
+    propio generador de eventos SSE)— y al terminar REGRESA (return) la
+    lista de filas ya procesadas (recuperable como el .value de la
+    StopIteration, o con 'resultado = yield from procesar_zip_candidato_progresivo(...)').
+
+    La categoría de cada documento se determina primero por el NOMBRE del
+    archivo (convención cv.pdf / ine.pdf / comprobante_domicilio.pdf / etc,
+    ver detectar_categoria_por_nombre_archivo) y, si el nombre no da ninguna
+    pista, se cae al reconocimiento por CONTENIDO de siempre (procesar_documento
+    sin categoria_forzada)."""
+    if nombres_pdf is None:
+        nombres_pdf = listar_pdfs_en_zip(ruta_zip)
+    filas = []
+    with zipfile.ZipFile(ruta_zip) as zf:
+        for nombre_interno in nombres_pdf:
+            nombre_base = os.path.basename(nombre_interno)
+            yield nombre_base
+            try:
+                ruta_extraida = zf.extract(nombre_interno, dir_extraccion)
+                categoria = detectar_categoria_por_nombre_archivo(nombre_base)
+                fila = procesar_documento(ruta_extraida, nombre_candidato, categoria_forzada=categoria)
+            except Exception as e:
+                fila = {
+                    "archivo": nombre_base, "categoria_clave": "ERROR",
+                    "categoria": "Error al procesar", "num_paginas": 0, "uso_ocr": False,
+                    "legible": False, "texto_muestra": "", "nombre_coincide": None,
+                    "detalle": f"Error: {e}",
+                }
+            filas.append(fila)
+    return filas
+
+
 def construir_reporte(candidato, filas):
     encontrados_por_categoria = {}
     for fila in filas:
@@ -870,27 +1003,29 @@ def _autoancho(ws, anchos):
         ws.column_dimensions[get_column_letter(i)].width = ancho
 
 
-def generar_excel(candidato, filas, checklist, extra, ruta_salida):
-    wb = Workbook()
-
-    ws = wb.active
-    ws.title = "Resumen"
-    ws["A1"] = "Expediente de reclutamiento — validación automática"
-    ws["A1"].font = Font(bold=True, size=14)
-    ws["A2"] = f"Candidato: {candidato['nombre']}"
-    ws["A3"] = f"RFC capturado: {candidato.get('rfc') or '—'}    CURP capturado: {candidato.get('curp') or '—'}"
-    ws["A4"] = f"Generado: {HOY.isoformat()}"
+def _llenar_hoja_resumen(ws, candidato, filas, checklist, extra, fila_inicio=1):
+    """Escribe el bloque de resumen (datos del candidato, completitud,
+    checklist, faltantes, vigencias, datos bancarios) empezando en
+    fila_inicio. Regresa la siguiente fila libre después de todo el bloque
+    -así generar_excel_lote puede seguir escribiendo el detalle por
+    documento justo abajo, en la MISMA hoja, para tener un solo tab por
+    candidato-. Usado tanto por generar_excel (un candidato, hoja propia)
+    como por generar_excel_lote (varios candidatos, una hoja por cada uno)."""
+    r0 = fila_inicio
+    ws.cell(row=r0, column=1, value="Expediente de reclutamiento — validación automática").font = Font(bold=True, size=14)
+    ws.cell(row=r0 + 1, column=1, value=f"Candidato: {candidato['nombre']}")
+    ws.cell(row=r0 + 2, column=1, value=f"RFC capturado: {candidato.get('rfc') or '—'}    CURP capturado: {candidato.get('curp') or '—'}")
+    ws.cell(row=r0 + 3, column=1, value=f"Generado: {HOY.isoformat()}")
 
     faltantes = [c for c in checklist if c["obligatorio"] and not c["recibido"]]
     completo = len(faltantes) == 0
-    ws["A6"] = "Estado de completitud:"
-    ws["A6"].font = Font(bold=True)
-    ws["B6"] = "COMPLETO" if completo else f"INCOMPLETO — faltan {len(faltantes)} documento(s)"
-    ws["B6"].fill = VERDE if completo else ROJO
-    ws["B6"].font = Font(bold=True)
+    ws.cell(row=r0 + 5, column=1, value="Estado de completitud:").font = Font(bold=True)
+    c_estado_general = ws.cell(row=r0 + 5, column=2, value="COMPLETO" if completo else f"INCOMPLETO — faltan {len(faltantes)} documento(s)")
+    c_estado_general.fill = VERDE if completo else ROJO
+    c_estado_general.font = Font(bold=True)
 
-    _set_encabezados(ws, ["Documento", "Obligatorio", "¿Recibido?", "Archivo(s)"], fila=8)
-    r = 9
+    _set_encabezados(ws, ["Documento", "Obligatorio", "¿Recibido?", "Archivo(s)"], fila=r0 + 7)
+    r = r0 + 8
     for item in checklist:
         ws.cell(row=r, column=1, value=item["categoria"])
         ws.cell(row=r, column=2, value="Sí" if item["obligatorio"] else "Condicional (solo si aplica)")
@@ -981,62 +1116,170 @@ def generar_excel(candidato, filas, checklist, extra, ruta_salida):
         r += 1
 
     _autoancho(ws, [42, 26, 20, 45])
+    return r + 1
 
-    ws2 = wb.create_sheet("Detalle por documento")
+
+def _llenar_hoja_detalle(ws, filas, fila_inicio=1):
+    """Escribe la tabla de detalle por documento (una fila por archivo)
+    empezando en fila_inicio. Regresa la siguiente fila libre. Igual que
+    _llenar_hoja_resumen, la usan tanto generar_excel (hoja propia) como
+    generar_excel_lote (debajo del resumen, en la misma hoja del candidato)."""
     encabezados2 = [
         "Archivo", "Documento identificado", "Páginas", "¿Usó OCR?", "Legible",
         "Nombre coincide", "Vigencia OK", "Fecha/vigencia detectada", "Banco (si aplica)",
         "Número de cuenta", "CLABE", "Observaciones",
     ]
-    _set_encabezados(ws2, encabezados2)
-    r = 2
+    _set_encabezados(ws, encabezados2, fila=fila_inicio)
+    r = fila_inicio + 1
+    fila_primera_dato = r
     for fila in filas:
-        ws2.cell(row=r, column=1, value=fila["archivo"])
-        ws2.cell(row=r, column=2, value=fila["categoria"])
-        ws2.cell(row=r, column=3, value=fila["num_paginas"])
-        ws2.cell(row=r, column=4, value="Sí" if fila["uso_ocr"] else "No")
+        ws.cell(row=r, column=1, value=fila["archivo"])
+        ws.cell(row=r, column=2, value=fila["categoria"])
+        ws.cell(row=r, column=3, value=fila["num_paginas"])
+        ws.cell(row=r, column=4, value="Sí" if fila["uso_ocr"] else "No")
 
-        c_leg = ws2.cell(row=r, column=5, value="Sí" if fila["legible"] else "NO — revisar")
+        c_leg = ws.cell(row=r, column=5, value="Sí" if fila["legible"] else "NO — revisar")
         c_leg.fill = VERDE if fila["legible"] else ROJO
 
         nc = fila.get("nombre_coincide")
         if fila["categoria_clave"] == "COMPROBANTE_DOMICILIO":
-            c_nom = ws2.cell(row=r, column=6, value="N/A (puede ser otra persona)")
+            c_nom = ws.cell(row=r, column=6, value="N/A (puede ser otra persona)")
             c_nom.fill = AMARILLO
         else:
             texto_nc = "Sí" if nc is True else "NO — revisar" if nc is False else "Dudoso — revisar"
-            c_nom = ws2.cell(row=r, column=6, value=texto_nc)
+            c_nom = ws.cell(row=r, column=6, value=texto_nc)
             c_nom.fill = VERDE if nc is True else ROJO if nc is False else AMARILLO
 
         vig = fila.get("vigencia_ok")
         if vig is None:
-            c_vig = ws2.cell(row=r, column=7, value="—")
+            c_vig = ws.cell(row=r, column=7, value="—")
         else:
-            c_vig = ws2.cell(row=r, column=7, value="OK" if vig else "FUERA DE RANGO — revisar")
+            c_vig = ws.cell(row=r, column=7, value="OK" if vig else "FUERA DE RANGO — revisar")
             c_vig.fill = VERDE if vig else ROJO
 
-        ws2.cell(row=r, column=8, value=fila.get("vigencia_fecha_texto") or "—")
+        ws.cell(row=r, column=8, value=fila.get("vigencia_fecha_texto") or "—")
 
         banco = fila.get("banco")
-        c_banco = ws2.cell(row=r, column=9, value=banco or "—")
+        c_banco = ws.cell(row=r, column=9, value=banco or "—")
         if fila.get("banco_rechazado"):
             c_banco.fill = ROJO
 
         # CLABE y número de cuenta se exportan como TEXTO (number_format "@")
         # para que Excel no los convierta a notación científica ni les
         # quite ceros a la izquierda.
-        c_cta = ws2.cell(row=r, column=10, value=fila.get("numero_cuenta") or "—")
+        c_cta = ws.cell(row=r, column=10, value=fila.get("numero_cuenta") or "—")
         c_cta.number_format = "@"
-        c_clabe = ws2.cell(row=r, column=11, value=fila.get("clabe") or "—")
+        c_clabe = ws.cell(row=r, column=11, value=fila.get("clabe") or "—")
         c_clabe.number_format = "@"
 
-        ws2.cell(row=r, column=12, value=fila["detalle"] + (" | Muestra: " + fila["texto_muestra"] if fila["legible"] else ""))
-        ws2.cell(row=r, column=12).alignment = Alignment(wrap_text=True, vertical="top")
+        ws.cell(row=r, column=12, value=fila["detalle"] + (" | Muestra: " + fila["texto_muestra"] if fila["legible"] else ""))
+        ws.cell(row=r, column=12).alignment = Alignment(wrap_text=True, vertical="top")
         r += 1
 
+    for fila_idx in range(fila_primera_dato, r):
+        ws.row_dimensions[fila_idx].height = 45
+
+    return r
+
+
+def generar_excel(candidato, filas, checklist, extra, ruta_salida):
+    """Un solo candidato -> 2 hojas (Resumen + Detalle por documento).
+    Es el mismo formato de siempre; el único cambio interno es que ahora
+    reutiliza _llenar_hoja_resumen / _llenar_hoja_detalle, que también usa
+    generar_excel_lote para la carga masiva."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Resumen"
+    _llenar_hoja_resumen(ws, candidato, filas, checklist, extra, fila_inicio=1)
+    _autoancho(ws, [42, 26, 20, 45])
+
+    ws2 = wb.create_sheet("Detalle por documento")
+    _llenar_hoja_detalle(ws2, filas, fila_inicio=1)
     _autoancho(ws2, [30, 26, 9, 10, 12, 20, 12, 24, 22, 18, 20, 70])
-    for fila_idx in range(2, r):
-        ws2.row_dimensions[fila_idx].height = 45
+
+    wb.save(ruta_salida)
+
+
+# ---------------------------------------------------------------------------
+# Carga masiva por ZIP: un Excel con una hoja por candidato
+# ---------------------------------------------------------------------------
+
+_CARACTERES_INVALIDOS_HOJA = re.compile(r"[\\/*?:\[\]]")
+
+
+def _nombre_hoja_excel_seguro(nombre_candidato, nombres_usados):
+    """Excel no permite \\ / * ? : [ ] en el nombre de una hoja, ni más de
+    31 caracteres, ni dos hojas con el mismo nombre. Aquí se limpia el
+    nombre del candidato para que sirva como nombre de hoja y, si ya existe
+    (dos candidatos con el mismo nombre en el mismo lote, o un nombre que
+    se trunca igual), se le agrega un sufijo numérico."""
+    base = _CARACTERES_INVALIDOS_HOJA.sub(" ", nombre_candidato or "Candidato").strip()
+    base = re.sub(r"\s+", " ", base) or "Candidato"
+    base = base[:31]
+    candidato_nombre_hoja = base
+    sufijo = 2
+    while candidato_nombre_hoja.lower() in nombres_usados:
+        sufijo_txt = f" ({sufijo})"
+        candidato_nombre_hoja = base[: 31 - len(sufijo_txt)] + sufijo_txt
+        sufijo += 1
+    nombres_usados.add(candidato_nombre_hoja.lower())
+    return candidato_nombre_hoja
+
+
+def _llenar_resumen_general(ws, resultados, nombres_hoja):
+    """Hoja de portada del Excel de lote: una fila por candidato con su
+    estado de completitud y un enlace directo a su hoja de detalle —así
+    quien revise el lote no tiene que ir abriendo hoja por hoja para saber
+    cuáles candidatos ya están completos."""
+    ws.cell(row=1, column=1, value="Carga masiva de expedientes — validación automática").font = Font(bold=True, size=14)
+    ws.cell(row=2, column=1, value=f"Generado: {HOY.isoformat()}")
+    ws.cell(row=3, column=1, value=f"Candidatos procesados: {len(resultados)}")
+
+    _set_encabezados(ws, ["#", "Candidato", "Estado", "Documentos faltantes (obligatorios)", "Ir al detalle"], fila=5)
+    r = 6
+    for i, (res, nombre_hoja) in enumerate(zip(resultados, nombres_hoja), start=1):
+        checklist = res["checklist"]
+        faltantes = [c for c in checklist if c["obligatorio"] and not c["recibido"]]
+        completo = len(faltantes) == 0
+        ws.cell(row=r, column=1, value=i)
+        ws.cell(row=r, column=2, value=res["candidato"]["nombre"])
+        c_estado = ws.cell(row=r, column=3, value="COMPLETO" if completo else f"INCOMPLETO — faltan {len(faltantes)}")
+        c_estado.fill = VERDE if completo else ROJO
+        c_estado.font = Font(bold=True)
+        ws.cell(row=r, column=4, value=", ".join(c["categoria"] for c in faltantes) or "—")
+        c_link = ws.cell(row=r, column=5, value="Ver detalle")
+        c_link.hyperlink = f"#'{nombre_hoja}'!A1"
+        c_link.font = Font(color="1155CC", underline="single")
+        r += 1
+
+    _autoancho(ws, [4, 32, 26, 60, 16])
+
+
+def generar_excel_lote(resultados, ruta_salida):
+    """Genera UN Excel para varios candidatos: una hoja 'Resumen general'
+    (portada con enlaces) + una hoja POR CANDIDATO con su resumen y su
+    detalle por documento combinados (para que sea un solo tab por
+    empleado, no dos). 'resultados' es una lista de dicts:
+    {"candidato": {...}, "filas": [...], "checklist": [...], "extra": [...]}."""
+    wb = Workbook()
+    ws_portada = wb.active
+    ws_portada.title = "Resumen general"
+
+    nombres_usados = set()
+    nombres_hoja = [_nombre_hoja_excel_seguro(res["candidato"]["nombre"], nombres_usados) for res in resultados]
+
+    _llenar_resumen_general(ws_portada, resultados, nombres_hoja)
+
+    for res, nombre_hoja in zip(resultados, nombres_hoja):
+        ws = wb.create_sheet(nombre_hoja)
+        r_libre = _llenar_hoja_resumen(ws, res["candidato"], res["filas"], res["checklist"], res["extra"], fila_inicio=1)
+        r_libre += 1  # una fila de separación visual antes del detalle
+        _llenar_hoja_detalle(ws, res["filas"], fila_inicio=r_libre)
+        # El resumen (arriba) solo usa las columnas A-D, pero como el detalle
+        # (abajo, misma hoja) usa 12 columnas, el ancho de columna se define
+        # una sola vez para toda la hoja con los anchos del detalle -son los
+        # que necesitan más espacio (observaciones, fechas, etc.)-.
+        _autoancho(ws, [30, 26, 9, 10, 12, 20, 12, 24, 22, 18, 20, 70])
 
     wb.save(ruta_salida)
 
