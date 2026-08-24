@@ -820,10 +820,10 @@ CONTENIDO_DESCARGAS = """
       <td>{{ archivo.reclutador or "—" }}</td>
       <td>{{ archivo.fecha_texto }}</td>
       <td>
-        <a href="/descargas/archivo/{{ archivo.nombre_interno }}">Descargar Excel</a>
+        <a href="/descargas/archivo/{{ archivo.nombre_interno }}">Descarga reporte</a>
         {% if archivo.zip_disponible %}
           &nbsp;·&nbsp;
-          <a href="/descargas/archivo/{{ archivo.zip_disponible }}">Descargar documentos (ZIP)</a>
+          <a href="/descargas/archivo/{{ archivo.zip_disponible }}">descargar documentos</a>
         {% endif %}
       </td>
     </tr>
