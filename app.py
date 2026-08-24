@@ -383,6 +383,7 @@ ESTILOS = """
   table.descargas th,table.descargas td{text-align:left;padding:8px 10px;border-bottom:1px solid #e6e6e6;}
   table.descargas th{color:#555;font-size:.78rem;text-transform:uppercase;letter-spacing:.03em;}
   table.descargas a{font-weight:600;}
+  .acciones-descarga{display:flex;flex-direction:column;gap:4px;}
   .vacio{color:#777;font-size:.9rem;padding:10px 0;}
   .aviso-info{background:#f5f0fa;border:1px solid #d9c7ec;border-radius:8px;padding:10px 14px;font-size:.85rem;margin-bottom:16px;color:#3c1053;}
 """
@@ -820,11 +821,12 @@ CONTENIDO_DESCARGAS = """
       <td>{{ archivo.reclutador or "—" }}</td>
       <td>{{ archivo.fecha_texto }}</td>
       <td>
-        <a href="/descargas/archivo/{{ archivo.nombre_interno }}">Descarga reporte</a>
-        {% if archivo.zip_disponible %}
-          &nbsp;·&nbsp;
-          <a href="/descargas/archivo/{{ archivo.zip_disponible }}">descargar documentos</a>
-        {% endif %}
+        <div class="acciones-descarga">
+          <a href="/descargas/archivo/{{ archivo.nombre_interno }}">Descarga reporte</a>
+          {% if archivo.zip_disponible %}
+            <a href="/descargas/archivo/{{ archivo.zip_disponible }}">Descargar documentos</a>
+          {% endif %}
+        </div>
       </td>
     </tr>
   {% else %}
