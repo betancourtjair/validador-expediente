@@ -15,17 +15,23 @@ propia página, no pestañas de JavaScript, para mantenerlo simple):
   /individual  Carga de UN candidato (nombre + RFC + CURP + documentos).
                Sin usuario ni contraseña. El Excel generado NO se descarga
                aquí: se guarda para que el equipo de reclutamiento lo
-               descargue después desde /descargas.
+               descargue después desde /descargas. Los documentos PDF
+               originales que subió el candidato TAMBIÉN se guardan, en un
+               ZIP aparte, para que el equipo los pueda descargar sin tener
+               que pedírselos otra vez al candidato.
   /lote        Carga masiva por ZIP (hasta 10 candidatos). Solo para el
                equipo de reclutamiento -pide usuario y contraseña-. El Excel
                consolidado SÍ se descarga de inmediato aquí, y ADEMÁS se
                guarda en /descargas (catalogado como "Candidatos varios")
-               por si se necesita volver a bajarlo después.
-  /descargas   Lista y descarga los expedientes generados por /individual,
-               más los Excel consolidados de /lote (catalogados como
-               "Candidatos varios"). Solo para el equipo de reclutamiento
-               -pide usuario y contraseña-. Los archivos se eliminan
-               automáticamente a los 7 días.
+               por si se necesita volver a bajarlo después. (Aquí no aplica
+               guardar un ZIP de documentos originales por separado: cada
+               candidato de la carga masiva YA se sube como un ZIP.)
+  /descargas   Lista y descarga los expedientes generados por /individual
+               -con opción de bajar también el ZIP de sus documentos
+               originales-, más los Excel consolidados de /lote (catalogados
+               como "Candidatos varios"). Solo para el equipo de
+               reclutamiento -pide usuario y contraseña-. Los archivos se
+               eliminan automáticamente a los 7 días.
 
 Cómo correrlo
 --------------
@@ -51,6 +57,7 @@ import shutil
 import sys
 import tempfile
 import time
+import zipfile
 from functools import wraps
 
 from flask import Flask, request, render_template_string, Response, stream_with_context
@@ -161,70 +168,152 @@ def _nombre_archivo_seguro(texto):
     return (base or "candidato")[:60]
 
 
-def guardar_expediente_individual(ruta_local_xlsx, nombre_candidato):
+def _guardar_archivo_individual(ruta_local, nombre_interno, nombre_candidato, content_type, reclutador=None):
+    """Función interna que hace el guardado real (a GCS, o a disco local si
+    no hay bucket configurado) de un archivo ya generado, bajo el nombre
+    interno indicado. La usan tanto guardar_expediente_individual() (el
+    Excel del expediente) como guardar_documentos_originales() (el ZIP con
+    los PDFs que subió el candidato). 'reclutador' es opcional -solo se usa
+    para el Excel consolidado de la carga masiva, que sí pide ese dato en el
+    formulario- y si se manda queda guardado junto con el nombre del
+    candidato para poder mostrarlo después en /descargas."""
+    metadatos = {"candidato": nombre_candidato}
+    if reclutador:
+        metadatos["reclutador"] = reclutador
+    if GCS_BUCKET_EXPEDIENTES:
+        bucket = _cliente_gcs().bucket(GCS_BUCKET_EXPEDIENTES)
+        blob = bucket.blob(f"individuales/{nombre_interno}")
+        blob.metadata = metadatos
+        blob.upload_from_filename(ruta_local, content_type=content_type)
+    else:
+        destino = os.path.join(ALMACEN_LOCAL_DIR, nombre_interno)
+        shutil.copyfile(ruta_local, destino)
+        with open(destino + ".meta.json", "w", encoding="utf-8") as fh:
+            json.dump(metadatos, fh, ensure_ascii=False)
+
+
+def guardar_expediente_individual(ruta_local_xlsx, nombre_candidato, reclutador=None):
     """Guarda un Excel ya generado para que el equipo de reclutamiento lo
     descargue después desde /descargas. Se usa tanto para un expediente de
     UN candidato (carga individual, nombre_candidato = su nombre) como para
     el Excel consolidado de la carga masiva (nombre_candidato = "Candidatos
-    varios", ya que ese archivo trae varios candidatos adentro). Regresa el
-    nombre interno con el que quedó guardado."""
+    varios", ya que ese archivo trae varios candidatos adentro; en ese caso
+    'reclutador' trae el nombre de quien subió la tanda, capturado en el
+    formulario de /lote). Regresa el nombre interno con el que quedó
+    guardado."""
     marca = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     nombre_interno = f"{marca}_{_nombre_archivo_seguro(nombre_candidato)}.xlsx"
-    if GCS_BUCKET_EXPEDIENTES:
-        bucket = _cliente_gcs().bucket(GCS_BUCKET_EXPEDIENTES)
-        blob = bucket.blob(f"individuales/{nombre_interno}")
-        blob.metadata = {"candidato": nombre_candidato}
-        blob.upload_from_filename(
-            ruta_local_xlsx,
-            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-    else:
-        destino = os.path.join(ALMACEN_LOCAL_DIR, nombre_interno)
-        shutil.copyfile(ruta_local_xlsx, destino)
-        with open(destino + ".meta.json", "w", encoding="utf-8") as fh:
-            json.dump({"candidato": nombre_candidato}, fh, ensure_ascii=False)
+    _guardar_archivo_individual(
+        ruta_local_xlsx,
+        nombre_interno,
+        nombre_candidato,
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        reclutador=reclutador,
+    )
     return nombre_interno
 
 
+def guardar_documentos_originales(rutas, nombre_candidato, nombre_interno_excel):
+    """Empaqueta en un ZIP los documentos PDF originales que subió el
+    candidato en la carga individual (los mismos que ya se validaron) y lo
+    guarda junto al Excel de su expediente, para que el equipo de
+    reclutamiento los pueda descargar después desde /descargas sin tener
+    que pedírselos otra vez al candidato. Solo tiene sentido para /individual
+    -la carga masiva no la usa, porque ahí cada candidato ya se sube como un
+    ZIP y ese no es el que se quiere ofrecer para descargar de vuelta-.
+
+    Usa el mismo "nombre interno" que el Excel del expediente (mismo
+    timestamp y candidato) pero con extensión .zip, para poder emparejarlos
+    después en listar_expedientes_individuales(). Regresa el nombre interno
+    del ZIP con el que quedó guardado."""
+    if not nombre_interno_excel.endswith(".xlsx"):
+        raise ValueError("nombre_interno_excel debe terminar en .xlsx")
+    nombre_interno_zip = nombre_interno_excel[: -len(".xlsx")] + ".zip"
+    ruta_zip = os.path.join(tempfile.gettempdir(), nombre_interno_zip)
+    try:
+        with zipfile.ZipFile(ruta_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+            for ruta in rutas:
+                if os.path.isfile(ruta):
+                    zf.write(ruta, arcname=os.path.basename(ruta))
+        _guardar_archivo_individual(ruta_zip, nombre_interno_zip, nombre_candidato, "application/zip")
+    finally:
+        if os.path.exists(ruta_zip):
+            os.remove(ruta_zip)
+    return nombre_interno_zip
+
+
 def listar_expedientes_individuales():
-    """Regresa la lista de expedientes individuales guardados (más reciente
-    primero), como dicts {nombre_interno, candidato, fecha}."""
+    """Regresa la lista de expedientes guardados (más reciente primero),
+    como dicts {nombre_interno, candidato, fecha, zip_disponible, reclutador}.
+    zip_disponible trae el nombre interno del ZIP con los documentos
+    originales si existe (solo puede existir para expedientes de la carga
+    individual; ver guardar_documentos_originales), o None si no hay uno.
+    reclutador trae el nombre de quien subió la tanda (solo aplica a los
+    Excel consolidados de la carga masiva; ver /lote), o None si no se
+    guardó ese dato (expedientes individuales, o lotes de antes de este
+    cambio)."""
     resultados = []
     if GCS_BUCKET_EXPEDIENTES:
         bucket = _cliente_gcs().bucket(GCS_BUCKET_EXPEDIENTES)
-        for blob in bucket.list_blobs(prefix="individuales/"):
+        blobs = list(bucket.list_blobs(prefix="individuales/"))
+        nombres_zip = {
+            blob.name.split("/", 1)[-1] for blob in blobs if blob.name.endswith(".zip")
+        }
+        for blob in blobs:
             nombre_interno = blob.name.split("/", 1)[-1]
-            if not nombre_interno:
+            if not nombre_interno or not nombre_interno.endswith(".xlsx"):
                 continue
-            candidato = (blob.metadata or {}).get("candidato") or nombre_interno
+            metadatos = blob.metadata or {}
+            candidato = metadatos.get("candidato") or nombre_interno
             fecha = blob.time_created or datetime.datetime.now(datetime.timezone.utc)
-            resultados.append({"nombre_interno": nombre_interno, "candidato": candidato, "fecha": fecha})
+            nombre_interno_zip = nombre_interno[: -len(".xlsx")] + ".zip"
+            resultados.append({
+                "nombre_interno": nombre_interno,
+                "candidato": candidato,
+                "fecha": fecha,
+                "zip_disponible": nombre_interno_zip if nombre_interno_zip in nombres_zip else None,
+                "reclutador": metadatos.get("reclutador") or None,
+            })
     else:
         for nombre_archivo in os.listdir(ALMACEN_LOCAL_DIR):
             if not nombre_archivo.endswith(".xlsx"):
                 continue
             ruta = os.path.join(ALMACEN_LOCAL_DIR, nombre_archivo)
             candidato = nombre_archivo
+            reclutador = None
             meta_path = ruta + ".meta.json"
             if os.path.exists(meta_path):
                 try:
                     with open(meta_path, encoding="utf-8") as fh:
-                        candidato = json.load(fh).get("candidato") or nombre_archivo
+                        metadatos = json.load(fh)
+                    candidato = metadatos.get("candidato") or nombre_archivo
+                    reclutador = metadatos.get("reclutador") or None
                 except Exception:
                     pass
+            nombre_interno_zip = nombre_archivo[: -len(".xlsx")] + ".zip"
+            zip_existe = os.path.isfile(os.path.join(ALMACEN_LOCAL_DIR, nombre_interno_zip))
             resultados.append({
                 "nombre_interno": nombre_archivo,
                 "candidato": candidato,
                 "fecha": datetime.datetime.fromtimestamp(os.path.getmtime(ruta)),
+                "zip_disponible": nombre_interno_zip if zip_existe else None,
+                "reclutador": reclutador,
             })
     resultados.sort(key=lambda r: r["fecha"], reverse=True)
     return resultados
 
 
 def leer_expediente_individual(nombre_interno):
-    """Regresa los bytes del Excel guardado, o None si no existe (ya se
+    """Regresa los bytes de un archivo guardado (el Excel de un expediente,
+    o el ZIP de sus documentos originales), o None si no existe (ya se
     borró, o el nombre no es válido)."""
-    if not nombre_interno or "/" in nombre_interno or ".." in nombre_interno or not nombre_interno.endswith(".xlsx"):
+    extensiones_validas = (".xlsx", ".zip")
+    if (
+        not nombre_interno
+        or "/" in nombre_interno
+        or ".." in nombre_interno
+        or not nombre_interno.endswith(extensiones_validas)
+    ):
         return None
     if GCS_BUCKET_EXPEDIENTES:
         bucket = _cliente_gcs().bucket(GCS_BUCKET_EXPEDIENTES)
@@ -642,6 +731,10 @@ CONTENIDO_LOTE = """
 </div>
 <div id="avisoTamanoLote"></div>
 <form method="post" action="/validar_lote" enctype="multipart/form-data" id="formLote">
+  <div class="campo">
+    <label>Nombre del reclutador</label>
+    <input type="text" name="reclutador" required>
+  </div>
   {% for i in range(1, 11) %}
   <div class="lote-fila">
     <div class="num">{{ i }}.</div>
@@ -712,21 +805,30 @@ CONTENIDO_DESCARGAS = """
 <h1>Documentos — expedientes guardados</h1>
 <div class="aviso-info">
   Aquí se descargan los expedientes en Excel generados por la <strong>carga
-  individual</strong> de candidatos, más los Excel consolidados de la
-  <strong>carga masiva</strong> (catalogados como "Candidatos varios"). Se
-  eliminan automáticamente 7 días después de haberse generado.
+  individual</strong> de candidatos -con opción de bajar también, en un solo
+  ZIP, los documentos originales que subió ese candidato-, más los Excel
+  consolidados de la <strong>carga masiva</strong> (catalogados como
+  "Candidatos varios", con el nombre de quien subió la tanda). Se eliminan
+  automáticamente 7 días después de haberse generado.
 </div>
 <table class="descargas">
-  <thead><tr><th>Candidato</th><th>Generado</th><th></th></tr></thead>
+  <thead><tr><th>Candidato</th><th>Reclutador</th><th>Generado</th><th></th></tr></thead>
   <tbody>
   {% for archivo in archivos %}
     <tr>
       <td>{{ archivo.candidato }}</td>
+      <td>{{ archivo.reclutador or "—" }}</td>
       <td>{{ archivo.fecha_texto }}</td>
-      <td><a href="/descargas/archivo/{{ archivo.nombre_interno }}">Descargar</a></td>
+      <td>
+        <a href="/descargas/archivo/{{ archivo.nombre_interno }}">Descargar Excel</a>
+        {% if archivo.zip_disponible %}
+          &nbsp;·&nbsp;
+          <a href="/descargas/archivo/{{ archivo.zip_disponible }}">Descargar documentos (ZIP)</a>
+        {% endif %}
+      </td>
     </tr>
   {% else %}
-    <tr><td colspan="3" class="vacio">Todavía no hay expedientes guardados.</td></tr>
+    <tr><td colspan="4" class="vacio">Todavía no hay expedientes guardados.</td></tr>
   {% endfor %}
   </tbody>
 </table>
@@ -774,9 +876,13 @@ def descargar_archivo(nombre_interno):
     datos = leer_expediente_individual(nombre_interno)
     if datos is None:
         return "Archivo no encontrado (puede que ya se haya eliminado automáticamente después de 7 días).", 404
+    if nombre_interno.endswith(".zip"):
+        mimetype = "application/zip"
+    else:
+        mimetype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     return Response(
         datos,
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        mimetype=mimetype,
         headers={"Content-Disposition": f'attachment; filename="{nombre_interno}"'},
     )
 
@@ -844,6 +950,24 @@ def _generar_eventos_validacion(tmp, rutas, candidato):
 
         nombre_interno = guardar_expediente_individual(salida, nombre)
         print(f"[validar] expediente de '{nombre}' guardado como '{nombre_interno}'", file=sys.stderr, flush=True)
+
+        # Además del Excel, se guarda un ZIP con los documentos PDF
+        # originales que subió el candidato (rutas, todavía vivos aquí
+        # porque el "finally" que los borra corre hasta después de este
+        # bloque). Si algo sale mal empaquetándolos NO se interrumpe el
+        # flujo -el Excel del expediente, que es lo más importante, ya
+        # quedó guardado bien-, solo se reporta en el log del servidor.
+        try:
+            nombre_interno_zip = guardar_documentos_originales(rutas, nombre, nombre_interno)
+            print(
+                f"[validar] documentos originales de '{nombre}' guardados como '{nombre_interno_zip}'",
+                file=sys.stderr, flush=True,
+            )
+        except Exception as e:
+            print(
+                f"[validar] no se pudieron guardar los documentos originales de '{nombre}': {e}",
+                file=sys.stderr, flush=True,
+            )
 
         hecho = total
         yield _evento_sse({
@@ -918,10 +1042,13 @@ def validar():
     return respuesta
 
 
-def _generar_eventos_validacion_lote(tmp_raiz, candidatos):
+def _generar_eventos_validacion_lote(tmp_raiz, candidatos, reclutador):
     """Generador de eventos SSE para /validar_lote (varios candidatos, un ZIP
     por candidato). 'candidatos' es una lista de dicts:
-    {"nombre": str, "ruta_zip": str, "dir_extraccion": str}.
+    {"nombre": str, "ruta_zip": str, "dir_extraccion": str}. 'reclutador' es
+    el nombre de quien subió la tanda (campo del formulario de /lote); se
+    guarda junto con el Excel consolidado para poder verlo después en
+    /descargas.
 
     Mismo motivo que _generar_eventos_validacion para usar streaming en vez
     de un hilo aparte: Cloud Run solo garantiza CPU mientras la petición HTTP
@@ -1053,10 +1180,10 @@ def _generar_eventos_validacion_lote(tmp_raiz, candidatos):
         # individuales. Se guarda ANTES de leer los bytes para el navegador
         # porque guardar_expediente_individual() solo necesita la ruta del
         # archivo en disco, no bloquea ni modifica el archivo.
-        nombre_interno_lote = guardar_expediente_individual(salida, "Candidatos varios")
+        nombre_interno_lote = guardar_expediente_individual(salida, "Candidatos varios", reclutador=reclutador)
         print(
             f"[validar_lote] expediente consolidado de {len(candidatos)} candidato(s) "
-            f"también guardado en Documentos como '{nombre_interno_lote}'",
+            f"(reclutador: {reclutador}) también guardado en Documentos como '{nombre_interno_lote}'",
             file=sys.stderr, flush=True,
         )
 
@@ -1087,6 +1214,10 @@ def _generar_eventos_validacion_lote(tmp_raiz, candidatos):
 @app.route("/validar_lote", methods=["POST"])
 @requiere_login
 def validar_lote():
+    reclutador = request.form.get("reclutador", "").strip()
+    if not reclutador:
+        return "Falta el nombre del reclutador", 400
+
     tmp_raiz = tempfile.mkdtemp(prefix="lote_")
     try:
         candidatos = []
@@ -1127,7 +1258,7 @@ def validar_lote():
         return f"Ocurrió un error recibiendo los archivos: {e}", 500
 
     respuesta = Response(
-        stream_with_context(_generar_eventos_validacion_lote(tmp_raiz, candidatos)),
+        stream_with_context(_generar_eventos_validacion_lote(tmp_raiz, candidatos, reclutador)),
         mimetype="text/event-stream",
     )
     respuesta.headers["Cache-Control"] = "no-cache"
