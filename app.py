@@ -18,11 +18,14 @@ propia página, no pestañas de JavaScript, para mantenerlo simple):
                descargue después desde /descargas.
   /lote        Carga masiva por ZIP (hasta 10 candidatos). Solo para el
                equipo de reclutamiento -pide usuario y contraseña-. El Excel
-               consolidado SÍ se descarga de inmediato aquí, y no se guarda.
-  /descargas   Lista y descarga los expedientes generados por /individual.
-               Solo para el equipo de reclutamiento -pide usuario y
-               contraseña-. Los archivos se eliminan automáticamente a los
-               7 días.
+               consolidado SÍ se descarga de inmediato aquí, y ADEMÁS se
+               guarda en /descargas (catalogado como "Candidatos varios")
+               por si se necesita volver a bajarlo después.
+  /descargas   Lista y descarga los expedientes generados por /individual,
+               más los Excel consolidados de /lote (catalogados como
+               "Candidatos varios"). Solo para el equipo de reclutamiento
+               -pide usuario y contraseña-. Los archivos se eliminan
+               automáticamente a los 7 días.
 
 Cómo correrlo
 --------------
@@ -159,9 +162,12 @@ def _nombre_archivo_seguro(texto):
 
 
 def guardar_expediente_individual(ruta_local_xlsx, nombre_candidato):
-    """Guarda el Excel ya generado de un candidato (carga individual) para
-    que el equipo de reclutamiento lo descargue después desde /descargas.
-    Regresa el nombre interno con el que quedó guardado."""
+    """Guarda un Excel ya generado para que el equipo de reclutamiento lo
+    descargue después desde /descargas. Se usa tanto para un expediente de
+    UN candidato (carga individual, nombre_candidato = su nombre) como para
+    el Excel consolidado de la carga masiva (nombre_candidato = "Candidatos
+    varios", ya que ese archivo trae varios candidatos adentro). Regresa el
+    nombre interno con el que quedó guardado."""
     marca = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     nombre_interno = f"{marca}_{_nombre_archivo_seguro(nombre_candidato)}.xlsx"
     if GCS_BUCKET_EXPEDIENTES:
@@ -532,15 +538,18 @@ Excel con el resultado.</p>
   convención (cv.pdf, ine.pdf, comprobante_domicilio.pdf, etc. — se explica
   con más detalle en esa página). <strong>Requiere iniciar sesión.</strong></p>
   <p>Al terminar se descarga de inmediato un solo Excel con una hoja por
-  cada candidato del lote.</p>
+  cada candidato del lote, y además se guarda una copia en
+  <strong>Documentos</strong> (catalogada como "Candidatos varios") por si
+  se necesita volver a bajarlo después.</p>
   <a class="boton" href="/lote">Ir a carga masiva</a>
 </div>
 
 <div class="tarjeta">
   <h2>3. Documentos (equipo de reclutamiento)</h2>
   <p>Aquí se descargan los expedientes en Excel generados por la
-  <strong>carga individual</strong> de los candidatos. <strong>Requiere
-  iniciar sesión.</strong></p>
+  <strong>carga individual</strong> de los candidatos, además de los Excel
+  consolidados de la <strong>carga masiva</strong> (catalogados como
+  "Candidatos varios"). <strong>Requiere iniciar sesión.</strong></p>
   <p>Los archivos se eliminan automáticamente 7 días después de haberse
   generado.</p>
   <a class="boton" href="/descargas">Ir a documentos</a>
@@ -626,6 +635,10 @@ CONTENIDO_LOTE = """
   <br><br>
   Límite: 10 candidatos por tanda y <strong>~28&nbsp;MB en total</strong> entre todos los
   ZIP juntos (límite de la plataforma) — si pesan más, sube los candidatos en 2 tandas.
+  <br><br>
+  El Excel consolidado se descarga de inmediato aquí, y además se guarda una copia en
+  <strong>Documentos</strong> (catalogada como "Candidatos varios") por si alguien necesita
+  volver a bajarlo después.
 </div>
 <div id="avisoTamanoLote"></div>
 <form method="post" action="/validar_lote" enctype="multipart/form-data" id="formLote">
@@ -696,11 +709,12 @@ configurarFormularioConProgreso({
 # Documentos (/descargas) — requiere iniciar sesión.
 # ---------------------------------------------------------------------------
 CONTENIDO_DESCARGAS = """
-<h1>Documentos — expedientes individuales</h1>
+<h1>Documentos — expedientes guardados</h1>
 <div class="aviso-info">
   Aquí se descargan los expedientes en Excel generados por la <strong>carga
-  individual</strong> de candidatos. Se eliminan automáticamente 7 días
-  después de haberse generado.
+  individual</strong> de candidatos, más los Excel consolidados de la
+  <strong>carga masiva</strong> (catalogados como "Candidatos varios"). Se
+  eliminan automáticamente 7 días después de haberse generado.
 </div>
 <table class="descargas">
   <thead><tr><th>Candidato</th><th>Generado</th><th></th></tr></thead>
@@ -712,7 +726,7 @@ CONTENIDO_DESCARGAS = """
       <td><a href="/descargas/archivo/{{ archivo.nombre_interno }}">Descargar</a></td>
     </tr>
   {% else %}
-    <tr><td colspan="3" class="vacio">Todavía no hay expedientes individuales guardados.</td></tr>
+    <tr><td colspan="3" class="vacio">Todavía no hay expedientes guardados.</td></tr>
   {% endfor %}
   </tbody>
 </table>
@@ -1028,6 +1042,24 @@ def _generar_eventos_validacion_lote(tmp_raiz, candidatos):
         salida = os.path.join(tmp_raiz, "expedientes_lote.xlsx")
         ve.generar_excel_lote(resultados, salida)
 
+        # A partir de este cambio, el Excel consolidado de la carga masiva
+        # TAMBIÉN se guarda en el mismo almacenamiento que usa /descargas
+        # -catalogado como "Candidatos varios", ya que es un solo archivo con
+        # varios candidatos adentro y no tiene sentido listarlo por nombre de
+        # candidato-, además de seguir descargándose de inmediato en el
+        # navegador como ya hacía. Así el equipo de reclutamiento puede
+        # volver a bajarlo después si lo necesita (por ejemplo si alguien
+        # perdió la descarga original), igual que los expedientes
+        # individuales. Se guarda ANTES de leer los bytes para el navegador
+        # porque guardar_expediente_individual() solo necesita la ruta del
+        # archivo en disco, no bloquea ni modifica el archivo.
+        nombre_interno_lote = guardar_expediente_individual(salida, "Candidatos varios")
+        print(
+            f"[validar_lote] expediente consolidado de {len(candidatos)} candidato(s) "
+            f"también guardado en Documentos como '{nombre_interno_lote}'",
+            file=sys.stderr, flush=True,
+        )
+
         with open(salida, "rb") as fh:
             data = fh.read()
 
@@ -1038,6 +1070,10 @@ def _generar_eventos_validacion_lote(tmp_raiz, candidatos):
             "total": total_general,
             "nombre_archivo": nombre_archivo_final,
             "datos_base64": base64.b64encode(data).decode("ascii"),
+            "mensaje": (
+                f"Listo: se descargó el Excel consolidado de {len(candidatos)} candidato(s) "
+                "y también se guardó una copia en Documentos (catalogada como \"Candidatos varios\")."
+            ),
         })
 
         print(f"[validar_lote] lote de {len(candidatos)} candidato(s) listo", file=sys.stderr, flush=True)

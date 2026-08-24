@@ -105,6 +105,32 @@ MESES_ABREV = {
     "JUL": 7, "AGO": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DIC": 12,
 }
 
+# Alternativa explícita de los nombres de mes (en vez de "cualquier letra")
+# para el patrón de fecha "<dia> DE <mes> DE <anio>" — ver el porqué en
+# PATRON_FECHA_LARGA más abajo. Se ordenan de más largo a más corto nomás
+# por higiene (ninguno es prefijo de otro, así que en la práctica no cambia
+# el resultado, pero evita sorpresas si algún día se agrega un mes con
+# nombre parecido a otro).
+_MESES_ALTERNATIVAS = "|".join(sorted(MESES.keys(), key=len, reverse=True))
+
+# Patrón de fecha "<dia> DE <mes> DE <anio>" (p.ej. "21 DE AGOSTO DE 2026").
+# Importante: el grupo del mes usa la alternativa explícita de nombres de
+# mes (_MESES_ALTERNATIVAS), NO "cualquier letra" ([A-ZÑ]+) como se hacía
+# antes. La razón: el texto extraído de algunos PDFs (la CSF en particular)
+# a veces pierde los espacios entre palabras ("21DEAGOSTODE2026"). Con
+# "cualquier letra", el grupo del mes se comía de forma "greedy" el "DE"
+# que le sigue (dejando "AGOSTODE", que no es un mes válido) y la fecha se
+# perdía por completo -eso hacía que, en la CSF, la fecha real de emisión
+# no se detectara y el script cayera en otra fecha del documento (como la
+# fecha de inicio de operaciones del contribuyente, mucho más vieja),
+# marcando por error la constancia como fuera de vigencia. Al limitar el
+# grupo del mes a los nombres de mes reales, el regex ya no puede "comerse"
+# el "DE" siguiente y la fecha se reconoce igual, con o sin espacios.
+PATRON_FECHA_LARGA = re.compile(
+    r"(\d{1,2})\s*(?:DE|DEL)?\s*(" + _MESES_ALTERNATIVAS + r")\s*(?:DE|DEL)?\s*(\d{4})",
+    re.IGNORECASE,
+)
+
 
 def busca_fechas(texto):
     """Devuelve una lista de (date, fragmento_texto) encontradas en el texto,
@@ -119,11 +145,7 @@ def busca_fechas(texto):
         except ValueError:
             pass
 
-    patron_letras = re.compile(
-        r"(\d{1,2})\s*(?:DE|DEL)?\s*([A-ZÑ]+)\s*(?:DE|DEL)?\s*(\d{4})",
-        re.IGNORECASE,
-    )
-    for m in patron_letras.finditer(normaliza(t)):
+    for m in PATRON_FECHA_LARGA.finditer(normaliza(t)):
         dia, mes_txt, anio = m.group(1), m.group(2), m.group(3)
         mes = MESES.get(mes_txt.upper())
         if mes:
@@ -623,6 +645,47 @@ def analiza_cuenta_bancaria(texto_completo, nombre_candidato):
     }
 
 
+def _fecha_emision_csf_por_etiqueta(t_norm):
+    """Busca el campo "Lugar y Fecha de Emisión" de la CSF (arriba a la
+    derecha del documento, junto al código de barras) y regresa la fecha que
+    lo acompaña, con formato "<lugar> A <dia> DE <mes> DE <anio>" (por
+    ejemplo "TLALPAN, CIUDAD DE MEXICO A 21 DE AGOSTO DE 2026").
+
+    Esta es la fecha correcta para calcular la vigencia de 3 meses: es la
+    fecha en que se generó/descargó la constancia desde el portal del SAT,
+    NO hay que confundirla con otras fechas que trae el documento (como la
+    fecha de inicio de operaciones del contribuyente, que puede tener años
+    de antigüedad).
+
+    Se busca dentro de una ventana amplia de texto después de la etiqueta
+    (en vez de exigir que la fecha venga inmediatamente después) porque la
+    extracción de texto de un PDF con columnas -como el encabezado de la
+    CSF, que trae la columna del QR/RFC a la izquierda y esta etiqueta a la
+    derecha- a veces intercala renglones de una columna con la otra; la
+    fecha en sí (p.ej. "21 DE AGOSTO DE 2026") sigue apareciendo completa y
+    en orden, solo que puede no estar pegada a la etiqueta.
+
+    Se prueba también la etiqueta sin espacios ("LUGARYFECHADEEMISION") por
+    si la pérdida de espacios de la extracción llega a afectar hasta al
+    propio texto de la etiqueta, no solo a la fecha."""
+    idx = t_norm.find("LUGAR Y FECHA DE EMISION")
+    if idx == -1:
+        idx = t_norm.find("LUGARYFECHADEEMISION")
+    if idx == -1:
+        return None
+    ventana = t_norm[idx:idx + 500]
+    m = PATRON_FECHA_LARGA.search(ventana)
+    if not m:
+        return None
+    mes = MESES.get(m.group(2))
+    if not mes:
+        return None
+    try:
+        return datetime.date(int(m.group(3)), mes, int(m.group(1)))
+    except ValueError:
+        return None
+
+
 def analiza_csf(paginas_texto):
     texto_completo = "\n".join(paginas_texto)
     t_norm = normaliza(texto_completo)
@@ -639,13 +702,33 @@ def analiza_csf(paginas_texto):
     else:
         obs.append("No se pudo leer el estatus del contribuyente en el texto; revisar manualmente.")
 
-    fechas = busca_fechas(texto_completo)
-    emision = fecha_mas_reciente_razonable(fechas)
+    # Se prioriza la fecha junto a "Lugar y Fecha de Emisión" (ver docstring
+    # de _fecha_emision_csf_por_etiqueta). Antes se usaba "la fecha más
+    # reciente de todo el documento", lo cual a veces tomaba por error una
+    # fecha vieja de otra sección de la CSF y marcaba la constancia como
+    # fuera de vigencia sin estarlo en realidad. Si por algún motivo no se
+    # encuentra la etiqueta (formato distinto, texto muy degradado), se cae
+    # de vuelta al método anterior como respaldo, dejando claro en las
+    # observaciones que debe revisarse a mano.
+    emision_fecha = _fecha_emision_csf_por_etiqueta(t_norm)
+    if emision_fecha:
+        obs.append(f"Fecha de emisión (\"Lugar y fecha de emisión\"): {emision_fecha.isoformat()}.")
+    else:
+        fechas = busca_fechas(texto_completo)
+        candidata = fecha_mas_reciente_razonable(fechas)
+        emision_fecha = candidata[0] if candidata else None
+        if emision_fecha:
+            obs.append(
+                f"No se encontró la etiqueta \"Lugar y fecha de emisión\"; se usó como respaldo la "
+                f"fecha más reciente detectada en el documento: {emision_fecha.isoformat()} "
+                "(revisar manualmente que sea correcta)."
+            )
+
     dentro_3_meses = None
-    if emision:
-        dias = (HOY - emision[0]).days
+    if emision_fecha:
+        dias = (HOY - emision_fecha).days
         dentro_3_meses = dias <= 92
-        obs.append(f"Fecha de emisión detectada: {emision[0].isoformat()} ({dias} días de antigüedad).")
+        obs.append(f"{dias} día(s) de antigüedad respecto a hoy ({HOY.isoformat()}).")
     else:
         obs.append("No se detectó una fecha de emisión clara; revisar manualmente.")
 
@@ -655,7 +738,7 @@ def analiza_csf(paginas_texto):
     return {
         "estatus": estatus,
         "activo": estatus == "ACTIVO",
-        "fecha_emision": emision[0] if emision else None,
+        "fecha_emision": emision_fecha,
         "dentro_3_meses": dentro_3_meses,
         "num_paginas_ok": len(paginas_texto) >= 2,
         "observaciones": " ".join(obs),
