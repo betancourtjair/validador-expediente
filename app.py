@@ -375,7 +375,7 @@ ESTILOS = """
   .lote-fila .num{font-weight:600;font-size:.85rem;color:#555;width:22px;flex:none;}
   .lote-fila input[type=text]{flex:1 1 auto;min-width:0;}
   .lote-fila input[type=file]{flex:1 1 auto;min-width:0;font-size:.82rem;}
-  #avisoTamanoLote{display:none;background:#fff3cd;border:1px solid #ffe08a;color:#7a5b00;border-radius:8px;padding:10px 14px;font-size:.85rem;margin-bottom:12px;}
+  #avisoTamanoLote,#avisoTamanoIndividual{display:none;background:#fff3cd;border:1px solid #ffe08a;color:#7a5b00;border-radius:8px;padding:10px 14px;font-size:.85rem;margin-bottom:12px;}
   .tarjeta{border:1px solid #e0e0e0;border-radius:10px;padding:16px 18px;margin-bottom:16px;}
   .tarjeta a.boton{display:inline-block;margin-top:10px;background:var(--fpt-morado);color:#fff;padding:9px 18px;border-radius:8px;text-decoration:none;font-size:.9rem;font-weight:600;}
   .tarjeta a.boton:hover{background:var(--fpt-morado-oscuro);}
@@ -535,6 +535,23 @@ function configurarFormularioConProgreso(opciones) {
     fetch(form.getAttribute("action"), { method: "POST", body: datos })
       .then(function (resp) {
         if (!resp.ok) {
+          // Un 413 lo regresa la plataforma (Cloud Run/GFE) ANTES de que la
+          // petición llegue al código de esta app -por eso el cuerpo es una
+          // página HTML genérica de error, no algo que este servidor pueda
+          // controlar-. Se detecta por status y se muestra un mensaje claro
+          // en español en vez de volcar ese HTML crudo en pantalla (el
+          // aviso de antesDeEnviar ya debería prevenir la mayoría de estos
+          // casos, pero esto cubre lo que se le escape, como archivos
+          // agregados después de la validación o navegadores que no
+          // corrieron ese chequeo).
+          if (resp.status === 413) {
+            throw new Error(
+              "Los documentos que subiste pesan demasiado para una sola petición " +
+              "(límite de la plataforma: ~32 MB). Reduce el tamaño de los PDF más " +
+              "pesados (vuelve a escanearlos a menor resolución o comprímelos) e " +
+              "inténtalo de nuevo."
+            );
+          }
           return resp.text().then(function (txt) {
             throw new Error(txt || ("Error del servidor (" + resp.status + ")"));
           });
@@ -657,6 +674,7 @@ CONTENIDO_INDIVIDUAL = """
   para que el equipo de reclutamiento lo revise — no se descarga nada en
   este paso.
 </div>
+<div id="avisoTamanoIndividual"></div>
 <form method="post" action="/validar" enctype="multipart/form-data" id="formValidador">
   <div class="campo">
     <label>Nombre completo del candidato</label>
@@ -694,6 +712,16 @@ CONTENIDO_INDIVIDUAL = """
 </form>
 """ + JS_NUCLEO + """
 <script>
+// Límite de la plataforma (Cloud Run/GFE) para el tamaño de una sola
+// petición HTTP: 32 MiB fijos, sin excepción -no es algo que se pueda subir
+// desde la configuración de la app-. Se deja un margen (28 MB) para los
+// demás campos del formulario y la sobrecarga propia de multipart/form-data.
+// Si la suma de los PDF seleccionados pasa de ese margen, se avisa ANTES de
+// mandar la petición -así el usuario no espera para nada a que el servidor
+// (en realidad la plataforma, antes de llegar al servidor) la rechace con un
+// "413 Request Entity Too Large"-.
+var LIMITE_TAMANO_INDIVIDUAL_BYTES = 28 * 1024 * 1024;
+
 configurarFormularioConProgreso({
   formId: "formValidador",
   botonId: "btnSubmit",
@@ -703,6 +731,36 @@ configurarFormularioConProgreso({
   barraTextoId: "barraTexto",
   mensajeInicial: "Procesando documentos (puede tardar uno o dos minutos)...",
   descargar: false,
+  antesDeEnviar: function () {
+    var aviso = document.getElementById("avisoTamanoIndividual");
+    var form = document.getElementById("formValidador");
+    var total = 0;
+    var archivos = [];
+    form.querySelectorAll('input[type="file"]').forEach(function (input) {
+      for (var i = 0; i < input.files.length; i++) {
+        var f = input.files[i];
+        total += f.size;
+        archivos.push(f);
+      }
+    });
+    if (total <= LIMITE_TAMANO_INDIVIDUAL_BYTES) {
+      aviso.style.display = "none";
+      return true;
+    }
+    // Se ordenan de mayor a menor para señalar cuáles conviene comprimir
+    // primero (normalmente son los documentos escaneados a mucha
+    // resolución, como la CSF o el comprobante de domicilio).
+    archivos.sort(function (a, b) { return b.size - a.size; });
+    var detalle = archivos.slice(0, 3).map(function (f) {
+      return f.name + " (" + (f.size / (1024 * 1024)).toFixed(1) + " MB)";
+    }).join(", ");
+    aviso.style.display = "block";
+    aviso.textContent = "Los documentos seleccionados suman " + (total / (1024 * 1024)).toFixed(1) +
+      " MB, y el límite de la plataforma es de aproximadamente 28 MB por envío. " +
+      "Los más pesados son: " + detalle + ". Vuelve a escanearlos a menor resolución (o " +
+      "comprime esos PDF) y vuelve a intentar.";
+    return false;
+  },
 });
 </script>
 """
