@@ -123,7 +123,7 @@ CAMPOS_DOCUMENTOS = [
     ("acta_nacimiento", "Acta de nacimiento", True),
     ("ine", "INE (ambos lados en 1 PDF)", True),
     ("comprobante_domicilio", "Comprobante de domicilio", True),
-    ("comprobante_estudios", "Comprobante de estudios", True),
+    ("comprobante_estudios", "Certificado de estudios", True),
     ("curp", "CURP", True),
     ("csf", "CSF (ambos lados en 1 PDF)", True),
     ("nss", "NSS", True),

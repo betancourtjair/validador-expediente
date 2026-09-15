@@ -33,6 +33,13 @@ REGLAS IMPLEMENTADAS
    confiable que buscar el nombre del banco en el texto). Se valida que
    existan cuenta, CLABE y nombre del colaborador, y se rechaza si el banco
    es Nu, Spin by OXXO o Mercado Pago.
+8. Datos extraídos para el resumen: además de las reglas de arriba, el
+   resumen muestra el RFC (leído de la CSF, junto a la etiqueta "RFC"), el
+   CURP (leído del documento CURP, formato de 18 caracteres), la fecha de
+   nacimiento (leída del acta, junto a la etiqueta "FECHA DE NACIMIENTO") y
+   la dirección (leída por separado del comprobante de domicilio y del
+   INE). Igual que el resto de los datos leídos por OCR, son una propuesta
+   a confirmar contra el documento original, no un dato ya verificado.
 
 LIMITACIONES IMPORTANTES (léelas antes de confiar 100% en el resultado)
 ------------------------------------------------------------------------
@@ -92,6 +99,21 @@ def normaliza(txt):
         return ""
     txt = unicodedata.normalize("NFKD", txt).encode("ascii", "ignore").decode("ascii")
     return re.sub(r"\s+", " ", txt).upper().strip()
+
+
+def _sin_acentos_mismo_largo(txt):
+    """Como normaliza(), pero SIN colapsar espacios ni recortar: cada
+    carácter acentuado (á, é, ñ, ü, ...) se reduce a su base de 1 solo
+    carácter, así que el resultado queda con exactamente el mismo largo
+    (y los mismos índices) que 'txt'. Se usa para poder buscar una
+    etiqueta ignorando acentos/mayúsculas y luego recortar el fragmento
+    que sigue directamente del texto ORIGINAL (con acentos y mayúsculas
+    tal cual los trae el documento), en vez de quedarse con la versión
+    en mayúsculas sin acentos -mucho menos legible para quien revisa el
+    reporte, por ejemplo al extraer una dirección."""
+    if not txt:
+        return ""
+    return unicodedata.normalize("NFKD", txt).encode("ascii", "ignore").decode("ascii").upper()
 
 
 MESES = {
@@ -426,7 +448,7 @@ CATEGORIAS = {
     "ACTA_NACIMIENTO": ("Acta de nacimiento", ["ACTA DE NACIMIENTO", "REGISTRO CIVIL", "OFICIALIA", "NACIMIENTOS"], True),
     "INE": ("INE", ["INSTITUTO NACIONAL ELECTORAL", "CREDENCIAL PARA VOTAR", "CLAVE DE ELECTOR"], True),
     "COMPROBANTE_DOMICILIO": ("Comprobante de domicilio", ["COMISION FEDERAL DE ELECTRICIDAD", "CFE", "TELMEX", "RECIBO", "TOTAL A PAGAR", "PERIODO FACTURADO", "IZZI", "TELEFONOS DE MEXICO", "AGUA"], True),
-    "COMPROBANTE_ESTUDIOS": ("Comprobante de estudios", ["CERTIFICADO DE ESTUDIOS", "CURSO Y ACREDITO", "UNIVERSIDAD", "LICENCIATURA", "CEDULA PROFESIONAL", "SECRETARIA DE EDUCACION", "BACHILLERATO", "PROMEDIO GENERAL"], True),
+    "COMPROBANTE_ESTUDIOS": ("Certificado de estudios", ["CERTIFICADO DE ESTUDIOS", "CURSO Y ACREDITO", "UNIVERSIDAD", "LICENCIATURA", "CEDULA PROFESIONAL", "SECRETARIA DE EDUCACION", "BACHILLERATO", "PROMEDIO GENERAL"], True),
     "CURP": ("CURP", ["CLAVE UNICA DE REGISTRO DE POBLACION", "CURP CERTIFICADA", "CLAVE:"], True),
     "CSF": ("CSF", ["CONSTANCIA DE SITUACION FISCAL", "CEDULA DE IDENTIFICACION FISCAL", "REGISTRO FEDERAL DE CONTRIBUYENTES"], True),
     "NSS": ("NSS", ["NUMERO DE SEGURIDAD SOCIAL", "INSTITUTO MEXICANO DEL SEGURO SOCIAL", "IMSS"], True),
@@ -565,8 +587,120 @@ def nombre_coincide(texto_doc, nombre_candidato):
 
 
 # ---------------------------------------------------------------------------
-# Reglas específicas por documento
+# Extracción de identificadores y datos personales (RFC, CURP, fecha de
+# nacimiento, dirección) — se agregan al resumen igual que los datos
+# bancarios de la carátula: son "propuesta a confirmar" (ver limitaciones
+# del OCR en el docstring del módulo), pensadas para que el equipo de
+# reclutamiento no tenga que volver a abrir cada PDF para copiar el dato,
+# pero sin reemplazar una revisión rápida contra el documento original.
 # ---------------------------------------------------------------------------
+
+# RFC de persona física: 4 letras (o 3 si es persona moral) + 6 dígitos
+# (fecha AAMMDD) + 3 caracteres alfanuméricos (homoclave). Ejemplo:
+# XAXX010101000 (el RFC genérico que usa el SAT para "público en general").
+PATRON_RFC = re.compile(r"\bRFC\b[:\.\-]?\s*([A-Z&]{3,4}\d{6}[A-Z0-9]{3})\b")
+
+# CURP: 18 caracteres siempre en este orden — 4 letras, 6 dígitos (fecha de
+# nacimiento AAMMDD), 1 letra H/M (sexo), 2 letras (código de entidad), 3
+# consonantes, 1 carácter alfanumérico (homoclave) y 1 dígito verificador.
+# Ejemplo: XEXX010101HNEXXXA4.
+PATRON_CURP = re.compile(r"\b([A-Z]{4}\d{6}[HM][A-Z]{5}[A-Z0-9]\d)\b")
+
+
+def extraer_rfc(texto_completo):
+    """Extrae el RFC del texto de la CSF, anclado a la etiqueta "RFC" (el
+    campo que la propia Constancia imprime con ese nombre). Regresa el RFC
+    detectado o None si no se encontró nada con el formato esperado."""
+    m = PATRON_RFC.search(normaliza(texto_completo))
+    return m.group(1) if m else None
+
+
+def extraer_curp(texto_completo):
+    """Extrae el CURP del texto del documento CURP, buscando la cadena de
+    18 caracteres con el formato oficial. Regresa el CURP detectado o None
+    si no se encontró nada con ese formato."""
+    m = PATRON_CURP.search(normaliza(texto_completo))
+    return m.group(1) if m else None
+
+
+def busca_fecha_nacimiento(texto):
+    """Busca la fecha de nacimiento en el acta, anclada a la etiqueta
+    'FECHA DE NACIMIENTO'. A diferencia de fecha_mas_reciente_razonable
+    (pensada para vigencias de 3 meses), aquí SÍ se aceptan fechas de hace
+    varias décadas -es justo lo esperado en una fecha de nacimiento-; solo
+    se descartan fechas futuras o absurdamente viejas (antes de 1900).
+    Regresa un date o None si no se encontró la etiqueta o no había una
+    fecha legible cerca."""
+    t_norm = normaliza(texto)
+    for etiqueta in ("FECHA DE NACIMIENTO", "FECHADENACIMIENTO"):
+        idx = t_norm.find(etiqueta)
+        if idx == -1:
+            continue
+        ventana = t_norm[idx: idx + len(etiqueta) + 40]
+        candidatas = [f for f in busca_fechas(ventana) if f[0] <= HOY and f[0].year >= 1900]
+        if candidatas:
+            return candidatas[0][0]
+    return None
+
+
+# Palabras que, si aparecen en un renglón después de la etiqueta de
+# domicilio, casi seguro ya indican que se salió del bloque de dirección y
+# se entró a otro campo del documento (periodo facturado, clave de
+# elector, etc.) -así no se arrastra ese texto pegado a la dirección-.
+_DIRECCION_ETIQUETAS_CORTE = [
+    "PERIODO", "TOTAL A PAGAR", "LIMITE DE PAGO", "PAGAR ANTES", "CORTE A PARTIR",
+    "CLAVE DE ELECTOR", "VIGENCIA", "SECCION", "CURP", "FOLIO", "ESTADO DE CUENTA",
+    "SUBTOTAL", "MEDIDOR", "CONSUMO", "REFERENCIA", "RFC", "FECHA DE NACIMIENTO",
+    "SEXO", "CLAVE DE LA ELECTORA", "INSTITUTO NACIONAL ELECTORAL", "CREDENCIAL PARA VOTAR",
+    "AVISO DE PRIVACIDAD", "ANO DE REGISTRO", "EMISION", "MUNICIPIO EMISOR",
+]
+
+
+def extraer_direccion(texto_completo, etiquetas, ventana=220, max_lineas=4):
+    """Extracción best-effort de una dirección: busca la primera de las
+    'etiquetas' dadas (ignorando acentos/mayúsculas) y arma la dirección
+    tomando, renglón por renglón, el texto ORIGINAL que sigue -con sus
+    acentos y mayúsculas/minúsculas tal cual los trae el documento, para
+    que sea legible-. Se detiene en el primer renglón vacío o en el primer
+    renglón que ya se ve como otro campo del documento (ver
+    _DIRECCION_ETIQUETAS_CORTE), para no arrastrar texto de otras secciones
+    pegado a la dirección; como respaldo también se limita a 'max_lineas'
+    renglones y a 'ventana' caracteres.
+
+    No existe un formato único de dirección en México que se pueda validar
+    con una expresión regular (a diferencia del RFC o el CURP), así que
+    esto SIEMPRE debe tratarse como una propuesta a confirmar contra el
+    documento original, nunca como un dato ya verificado."""
+    texto_original = texto_completo or ""
+    texto_plano = _sin_acentos_mismo_largo(texto_original)
+    for etiqueta in etiquetas:
+        idx = texto_plano.find(etiqueta)
+        if idx == -1:
+            continue
+        fin = idx + len(etiqueta) + ventana
+        lineas_orig = texto_original[idx + len(etiqueta): fin].split("\n")
+        lineas_plano = texto_plano[idx + len(etiqueta): fin].split("\n")
+
+        recolectadas = []
+        for linea_orig, linea_plano in zip(lineas_orig, lineas_plano):
+            linea_orig_limpia = re.sub(r"\s+", " ", linea_orig).strip(" :.-\t")
+            linea_plano_limpia = linea_plano.strip()
+            if not linea_plano_limpia:
+                if recolectadas:
+                    break
+                continue  # renglón vacío antes de empezar: se ignora, no corta
+            if any(corte in linea_plano_limpia for corte in _DIRECCION_ETIQUETAS_CORTE):
+                break
+            if linea_orig_limpia:
+                recolectadas.append(linea_orig_limpia)
+            if len(recolectadas) >= max_lineas:
+                break
+
+        fragmento = ", ".join(recolectadas).strip(" ,")
+        if len(fragmento) >= 8:
+            return fragmento
+    return None
+
 
 CODIGOS_CLABE_BANCOS = {
     "002": "Banamex/Citibanamex", "006": "Bancomext", "009": "Banobras",
@@ -691,6 +825,12 @@ def analiza_csf(paginas_texto):
     t_norm = normaliza(texto_completo)
     obs = []
 
+    rfc = extraer_rfc(texto_completo)
+    if rfc:
+        obs.append(f"RFC detectado: {rfc}.")
+    else:
+        obs.append("No se detectó un RFC con el formato esperado junto a la etiqueta 'RFC'; revisar manualmente.")
+
     # el PDF de la CSF a veces pierde los espacios entre palabras al extraer texto
     # ("Estatusenelpadrón:ACTIVO"), así que probamos con y sin espacios.
     m_estatus = re.search(r"ESTATUS\s*EN\s*EL\s*PADRON\s*:?\s*([A-Z]+)", t_norm)
@@ -738,6 +878,7 @@ def analiza_csf(paginas_texto):
     return {
         "estatus": estatus,
         "activo": estatus == "ACTIVO",
+        "rfc": rfc,
         "fecha_emision": emision_fecha,
         "dentro_3_meses": dentro_3_meses,
         "num_paginas_ok": len(paginas_texto) >= 2,
@@ -929,9 +1070,18 @@ def procesar_documento(ruta, nombre_candidato, categoria_forzada=None):
         fila["vigencia_ok"] = r["dentro_3_meses"]
         fila["vigencia_fecha_texto"] = r["fecha_emision"].isoformat() if r["fecha_emision"] else None
         fila["estatus_sat"] = r["estatus"]
+        fila["rfc"] = r["rfc"]
         detalles_extra.append(r["observaciones"])
         if not r["num_paginas_ok"]:
             detalles_extra.append("Falta la segunda hoja de la CSF en este PDF (debe traer ambas en 1 solo archivo).")
+
+    elif clave == "CURP":
+        curp = extraer_curp(texto_completo)
+        fila["curp"] = curp
+        if curp:
+            detalles_extra.append(f"CURP detectado: {curp}.")
+        else:
+            detalles_extra.append("No se detectó un CURP con el formato esperado (18 caracteres); revisar manualmente.")
 
     elif clave == "INE":
         # La vigencia SIEMPRE se revisa en la cara frontal (página 1) contra
@@ -942,12 +1092,27 @@ def procesar_documento(ruta, nombre_candidato, categoria_forzada=None):
         fila["vigencia_fecha_texto"] = f"Vigente hasta {r['vigencia_anio_fin']}" if r["vigencia_anio_fin"] else None
         fila["num_paginas_ok"] = r["dos_paginas"]
         detalles_extra.append(r["observaciones"])
+        direccion_ine = extraer_direccion(texto_completo, ["DOMICILIO"])
+        fila["direccion"] = direccion_ine
+        if direccion_ine:
+            detalles_extra.append(f"Dirección detectada en el INE (revisar contra el documento): {direccion_ine}")
+        else:
+            detalles_extra.append("No se detectó la etiqueta 'DOMICILIO' en el INE; revisar manualmente.")
 
     elif clave == "COMPROBANTE_DOMICILIO":
         dentro, obs, fecha = analiza_comprobante_domicilio(texto_completo)
         fila["vigencia_ok"] = dentro
         fila["vigencia_fecha_texto"] = fecha.isoformat() if fecha else None
         detalles_extra.append(obs)
+        direccion_domicilio = extraer_direccion(texto_completo, [
+            "DOMICILIO DEL SERVICIO", "DOMICILIO DEL USUARIO", "NOMBRE Y DOMICILIO DEL USUARIO",
+            "DIRECCION DEL SERVICIO", "DOMICILIO DE INSTALACION", "DOMICILIO",
+        ])
+        fila["direccion"] = direccion_domicilio
+        if direccion_domicilio:
+            detalles_extra.append(f"Dirección detectada en el comprobante de domicilio (revisar contra el documento): {direccion_domicilio}")
+        else:
+            detalles_extra.append("No se detectó una etiqueta de domicilio reconocible en el comprobante; revisar manualmente.")
 
     elif clave == "CUENTA_BANCARIA":
         r = analiza_cuenta_bancaria(texto_completo, nombre_candidato)
@@ -967,6 +1132,16 @@ def procesar_documento(ruta, nombre_candidato, categoria_forzada=None):
         fila["vigencia_ok"] = dentro
         fila["vigencia_fecha_texto"] = fecha.isoformat() if fecha else None
         detalles_extra.append(obs + " (regla de 5 años detectada como práctica común; confirmar si aplica formalmente).")
+
+        fecha_nac = busca_fecha_nacimiento(texto_completo)
+        fila["fecha_nacimiento_texto"] = fecha_nac.strftime("%d/%m/%Y") if fecha_nac else None
+        if fecha_nac:
+            detalles_extra.append(f"Fecha de nacimiento detectada: {fecha_nac.strftime('%d/%m/%Y')}.")
+        else:
+            detalles_extra.append(
+                "No se detectó la fecha de nacimiento (etiqueta 'FECHA DE NACIMIENTO' no encontrada o sin "
+                "fecha legible cerca); revisar manualmente."
+            )
 
     fila["detalle"] += " ".join(detalles_extra)
     return fila
@@ -1175,6 +1350,39 @@ def _llenar_hoja_resumen(ws, candidato, filas, checklist, extra, fila_inicio=1):
             r += 1
     else:
         ws.cell(row=r, column=1, value="No se recibieron documentos con regla de vigencia.")
+        r += 1
+
+    # --- Datos extraídos de los documentos (RFC de la CSF, CURP del
+    # documento CURP, fecha de nacimiento del acta, dirección del
+    # comprobante de domicilio y del INE por separado). Igual que los datos
+    # bancarios de abajo, son "propuesta a confirmar": se muestran para que
+    # el equipo de reclutamiento no tenga que abrir cada PDF, pero siguen
+    # marcados como pendientes de revisar contra el documento original. ---
+    csf_fila = next((f for f in filas if f["categoria_clave"] == "CSF"), None)
+    curp_fila = next((f for f in filas if f["categoria_clave"] == "CURP"), None)
+    acta_fila = next((f for f in filas if f["categoria_clave"] == "ACTA_NACIMIENTO"), None)
+    domicilio_fila = next((f for f in filas if f["categoria_clave"] == "COMPROBANTE_DOMICILIO"), None)
+    ine_fila = next((f for f in filas if f["categoria_clave"] == "INE"), None)
+
+    r += 2
+    ws.cell(row=r, column=1, value="Datos extraídos de los documentos (propuesta a confirmar contra el PDF):").font = Font(bold=True)
+    r += 1
+    _set_encabezados(ws, ["Dato", "Valor detectado", "Fuente"], fila=r)
+    r += 1
+    datos_extraidos = [
+        ("RFC", csf_fila.get("rfc") if csf_fila else None, "CSF"),
+        ("CURP", curp_fila.get("curp") if curp_fila else None, "Documento CURP"),
+        ("Fecha de nacimiento", acta_fila.get("fecha_nacimiento_texto") if acta_fila else None, "Acta de nacimiento"),
+        ("Dirección", domicilio_fila.get("direccion") if domicilio_fila else None, "Comprobante de domicilio"),
+        ("Dirección (INE)", ine_fila.get("direccion") if ine_fila else None, "INE"),
+    ]
+    for etiqueta, valor, fuente in datos_extraidos:
+        ws.cell(row=r, column=1, value=etiqueta)
+        c_valor = ws.cell(row=r, column=2, value=valor or "No detectado")
+        c_valor.number_format = "@"  # forzar texto: RFC/CURP no deben interpretarse como número
+        if not valor:
+            c_valor.fill = AMARILLO
+        ws.cell(row=r, column=3, value=fuente)
         r += 1
 
     # --- Datos bancarios de la carátula, exportados como texto para que no
