@@ -38,8 +38,14 @@ REGLAS IMPLEMENTADAS
    CURP (leído del documento CURP, formato de 18 caracteres), la fecha de
    nacimiento (leída del acta, junto a la etiqueta "FECHA DE NACIMIENTO") y
    la dirección (leída por separado del comprobante de domicilio y del
-   INE). Igual que el resto de los datos leídos por OCR, son una propuesta
-   a confirmar contra el documento original, no un dato ya verificado.
+   INE). De la CSF también se leen, de la propia constancia: el CURP, el
+   Código Postal (bajo "Datos del domicilio registrado") y el Régimen
+   (bajo "Regímenes", en la hoja 2). De los avisos de retención -ahora
+   documentos separados- se lee el Número de crédito: en Infonavit, bajo
+   el apartado "Información del crédito del trabajador"; en Fonacot, junto
+   a la etiqueta "número de crédito". Igual que el resto de los datos
+   leídos por OCR, son una propuesta a confirmar contra el documento
+   original, no un dato ya verificado.
 
 LIMITACIONES IMPORTANTES (léelas antes de confiar 100% en el resultado)
 ------------------------------------------------------------------------
@@ -438,6 +444,59 @@ def extraer_texto_pdf(ruta):
     return paginas_texto, num_paginas, ocr_usado
 
 
+def _ocr_hd_forzado(ruta, indice_pagina=0, todas_las_variantes=False):
+    """Repite el pase HD de OCR (300 dpi, corrección de rotación, y las 4
+    combinaciones de preprocesado/segmentación que usa extraer_texto_pdf)
+    para UNA página específica, sin importar la confianza que haya
+    reportado el pase rápido.
+
+    Se usa como último recurso para campos puntuales que en la práctica
+    resultan más sensibles a la calidad del OCR que el resto del
+    documento — el caso encontrado fue el "Número de crédito" del aviso
+    de Fonacot: viene en una tabla angosta (dos columnas muy juntas) que
+    el pase rápido a veces lee mal justo ahí (la confianza PROMEDIO de la
+    página sale alta porque el resto del documento sí se lee bien, así
+    que extraer_texto_pdf nunca escala al pase HD).
+
+    Por default regresa el texto de mayor confianza entre las 4
+    combinaciones (o "" si no se pudo rasterizar la página). Si
+    todas_las_variantes=True regresa, en cambio, la lista completa de los 4
+    textos (puede traer "" para alguna combinación que haya fallado) — útil
+    cuando la palabra clave que se busca resultó más estable en los DÍGITOS
+    que en la ETIQUETA según la combinación (ver PATRON_NUMERO_CREDITO_FONACOT_ALT),
+    así que conviene probar el patrón contra las 4 en vez de solo la de
+    mayor confianza general."""
+    try:
+        imagenes_hd = convert_from_path(
+            ruta, dpi=300, first_page=indice_pagina + 1, last_page=indice_pagina + 1, grayscale=True
+        )
+    except Exception as e:
+        print(f"  [aviso] no se pudo rasterizar en HD (forzado) la página {indice_pagina+1} ({e})", file=sys.stderr)
+        return [] if todas_las_variantes else ""
+    if not imagenes_hd:
+        return [] if todas_las_variantes else ""
+    imagen_hd = _corrige_rotacion(imagenes_hd[0])
+    del imagenes_hd
+
+    variantes = []
+    mejor_texto, mejor_confianza = "", -1.0
+    for nivel in ("ligero", "fuerte"):
+        imagen_candidata = _preprocesa_para_ocr(imagen_hd, nivel=nivel)
+        for psm in ("3", "6"):
+            try:
+                candidato, confianza = _ocr_con_confianza(imagen_candidata, lang="spa", config=f"--psm {psm}")
+            except Exception:
+                candidato, confianza = "", -1.0
+            variantes.append(candidato)
+            if candidato and confianza > mejor_confianza:
+                mejor_texto, mejor_confianza = candidato, confianza
+        del imagen_candidata
+    del imagen_hd
+    if todas_las_variantes:
+        return variantes
+    return mejor_texto
+
+
 # ---------------------------------------------------------------------------
 # Clasificación de documento
 # ---------------------------------------------------------------------------
@@ -453,7 +512,8 @@ CATEGORIAS = {
     "CSF": ("CSF", ["CONSTANCIA DE SITUACION FISCAL", "CEDULA DE IDENTIFICACION FISCAL", "REGISTRO FEDERAL DE CONTRIBUYENTES"], True),
     "NSS": ("NSS", ["NUMERO DE SEGURIDAD SOCIAL", "INSTITUTO MEXICANO DEL SEGURO SOCIAL", "IMSS"], True),
     "CUENTA_BANCARIA": ("Cuenta bancaria", ["CLABE", "ESTADO DE CUENTA", "NO. DE CUENTA", "CARATULA"], True),
-    "INFONAVIT_FONACOT": ("Aviso de retención Infonavit/Fonacot", ["INFONAVIT", "FONACOT", "AVISO DE RETENCION"], False),
+    "INFONAVIT": ("Aviso de retención Infonavit", ["INFONAVIT", "INSTITUTO DEL FONDO NACIONAL DE LA VIVIENDA", "AVISO PARA RETENCION DE DESCUENTOS"], False),
+    "FONACOT": ("Aviso de retención Fonacot", ["FONACOT", "INSTITUTO FONACOT"], False),
     # condicionales: aplican según el puesto (entrenador, barbero, estilista) o la situación del candidato
     "CERTIFICADO_MEDICO": ("Certificado médico", ["CERTIFICADO MEDICO", "RECONOCIMIENTO MEDICO", "MEDICO CIRUJANO"], False),
     "CERTIFICADO_INSTRUCTOR": ("Certificado de entrenador / barbero / estilista", ["CERTIFICADO", "FITNESS COACH", "ENTRENADOR", "ESTILISTA", "BARBERO", "BARBER", "COSMETOLOGIA", "COSMETOLOGO", "DIPLOMADO"], False),
@@ -464,12 +524,12 @@ CATEGORIAS = {
 CHECKLIST_OBLIGATORIO = [
     "CV", "ACTA_NACIMIENTO", "INE", "COMPROBANTE_DOMICILIO",
     "COMPROBANTE_ESTUDIOS", "CURP", "CSF", "NSS", "CUENTA_BANCARIA",
-    "INFONAVIT_FONACOT", "CERTIFICADO_MEDICO", "CERTIFICADO_INSTRUCTOR",
+    "INFONAVIT", "FONACOT", "CERTIFICADO_MEDICO", "CERTIFICADO_INSTRUCTOR",
     "CONSTANCIA_LABORAL",
 ]
 
 # de estos, cuáles son condicionales (no siempre aplican) en vez de siempre-obligatorios
-CONDICIONALES = {"INFONAVIT_FONACOT", "CERTIFICADO_MEDICO", "CERTIFICADO_INSTRUCTOR", "CONSTANCIA_LABORAL"}
+CONDICIONALES = {"INFONAVIT", "FONACOT", "CERTIFICADO_MEDICO", "CERTIFICADO_INSTRUCTOR", "CONSTANCIA_LABORAL"}
 
 
 def clasificar(texto_completo, nombre_archivo):
@@ -485,7 +545,8 @@ def clasificar(texto_completo, nombre_archivo):
             "COMPROBANTE_ESTUDIOS": ["GRADO", "ESTUDIOS", "TITULO", "CEDULA"],
             "CURP": ["CURP"], "CSF": ["CSF", "CONSTANCIA", "FISCAL"], "NSS": ["NSS", "SEGURIDAD SOCIAL", "LOCALIZACION"],
             "CUENTA_BANCARIA": ["CUENTA", "BANCO", "ESTADO DE CUENTA", "CARATULA"],
-            "INFONAVIT_FONACOT": ["INFONAVIT", "FONACOT"],
+            "INFONAVIT": ["INFONAVIT"],
+            "FONACOT": ["FONACOT"],
             "CERTIFICADO_INSTRUCTOR": ["CERTIFICADO", "BARBER", "ESTILISTA", "COACH"],
             "CERTIFICADO_MEDICO": ["MEDICO"],
             "CONSTANCIA_LABORAL": ["LABORAL", "CONSTANCIA"],
@@ -525,7 +586,8 @@ ALIAS_ARCHIVO = {
     "CSF": ["csf", "constancia_situacion_fiscal", "situacion_fiscal", "fiscal"],
     "NSS": ["nss", "seguridad_social", "imss"],
     "CUENTA_BANCARIA": ["cuenta_bancaria", "cuenta", "caratula_bancaria", "caratula", "clabe", "estado_cuenta"],
-    "INFONAVIT_FONACOT": ["infonavit_fonacot", "infonavit", "fonacot"],
+    "INFONAVIT": ["infonavit"],
+    "FONACOT": ["fonacot"],
     "CERTIFICADO_MEDICO": ["certificado_medico", "medico"],
     "CERTIFICADO_INSTRUCTOR": ["certificado_instructor", "certificado_entrenador", "entrenador", "barbero", "estilista", "coach"],
     "CONSTANCIA_LABORAL": ["constancia_laboral", "carta_laboral", "laboral", "referencia_laboral"],
@@ -616,11 +678,151 @@ def extraer_rfc(texto_completo):
 
 
 def extraer_curp(texto_completo):
-    """Extrae el CURP del texto del documento CURP, buscando la cadena de
-    18 caracteres con el formato oficial. Regresa el CURP detectado o None
-    si no se encontró nada con ese formato."""
+    """Extrae el CURP del texto del documento CURP (o de la CSF, que también
+    lo trae impreso), buscando la cadena de 18 caracteres con el formato
+    oficial. Regresa el CURP detectado o None si no se encontró nada con ese
+    formato."""
     m = PATRON_CURP.search(normaliza(texto_completo))
     return m.group(1) if m else None
+
+
+# Códigos de entidad federativa que usa el CURP (posiciones 12-13), definidos
+# por RENAPO -no son los mismos que las abreviaturas postales comunes-. "NE"
+# es el código reservado para quien nació en el extranjero.
+CURP_ESTADOS = {
+    "AS": "Aguascalientes", "BC": "Baja California", "BS": "Baja California Sur",
+    "CC": "Campeche", "CL": "Coahuila", "CS": "Chiapas", "CH": "Chihuahua",
+    "DF": "Ciudad de México", "CM": "Ciudad de México", "DG": "Durango",
+    "GT": "Guanajuato", "GR": "Guerrero", "HG": "Hidalgo", "JC": "Jalisco",
+    "MC": "México", "MN": "Michoacán", "MS": "Morelos", "NT": "Nayarit",
+    "NL": "Nuevo León", "OC": "Oaxaca", "PL": "Puebla", "QO": "Querétaro",
+    "QR": "Quintana Roo", "SP": "San Luis Potosí", "SL": "Sinaloa",
+    "SR": "Sonora", "TC": "Tabasco", "TS": "Tamaulipas", "TL": "Tlaxcala",
+    "VZ": "Veracruz", "YN": "Yucatán", "ZS": "Zacatecas", "NE": "Extranjero",
+}
+
+
+def datos_derivados_de_curp(curp):
+    """A partir de un CURP con formato válido (18 caracteres), deriva
+    género, estado de nacimiento y si corresponde a alguien nacido en
+    México -sin depender de que el documento CURP se haya leído bien en
+    esos renglones-, usando las posiciones fijas que define RENAPO (11:
+    sexo H/M: 12-13: entidad). Se usa solo como PROPUESTA para precargar la
+    hoja "Datos completos" del Excel; no reemplaza los datos que el propio
+    candidato capture. Regresa {} si el CURP no trae un formato reconocible."""
+    if not curp or len(curp) != 18:
+        return {}
+    sexo = curp[10]
+    entidad = curp[11:13]
+    genero = "Hombre" if sexo == "H" else "Mujer" if sexo == "M" else None
+    estado_nacimiento = CURP_ESTADOS.get(entidad)
+    nacionalidad = None
+    if estado_nacimiento:
+        nacionalidad = "Extranjera" if entidad == "NE" else "Mexicana"
+
+    # Fecha de nacimiento: posiciones 5-10 del CURP (después de las 4 letras
+    # iniciales) traen AAMMDD. El propio CURP no dice el siglo, pero la
+    # convención de RENAPO para el diferenciador (posición 18, el
+    # penúltimo... en realidad posición 17, un carácter antes del dígito
+    # verificador) es que sea una LETRA para quien nació en o después del
+    # 2000, y un DÍGITO para quien nació antes -así se resuelve el siglo sin
+    # ambigüedad-.
+    aa, mm, dd = curp[4:6], curp[6:8], curp[8:10]
+    diferenciador = curp[16]
+    siglo = 2000 if diferenciador.isalpha() else 1900
+    fecha_nacimiento = None
+    try:
+        fecha_nacimiento = datetime.date(siglo + int(aa), int(mm), int(dd))
+    except ValueError:
+        fecha_nacimiento = None
+
+    edad = None
+    if fecha_nacimiento:
+        edad = HOY.year - fecha_nacimiento.year - ((HOY.month, HOY.day) < (fecha_nacimiento.month, fecha_nacimiento.day))
+
+    return {
+        "genero": genero, "estado_nacimiento": estado_nacimiento, "nacionalidad": nacionalidad,
+        "fecha_nacimiento": fecha_nacimiento, "edad": edad,
+    }
+
+
+# Código Postal de la CSF: bajo "Datos del domicilio registrado", etiqueta
+# "Código Postal:" seguida directamente de 5 dígitos (a veces sin espacio,
+# p.ej. "Código Postal:97203").
+PATRON_CP_CSF = re.compile(r"CODIGO\s*POSTAL\s*:?\s*(\d{5})\b")
+
+
+def extraer_codigo_postal_csf(texto_completo):
+    """Extrae el Código Postal impreso en la CSF, anclado a la etiqueta
+    "Código Postal" de la sección "Datos del domicilio registrado". Regresa
+    el CP detectado o None si no se encontró."""
+    m = PATRON_CP_CSF.search(normaliza(texto_completo))
+    return m.group(1) if m else None
+
+
+# Régimen de la CSF: en la hoja 2, bajo la sección "Regímenes", una tabla con
+# encabezados "Régimen | Fecha Inicio | Fecha Fin" y debajo el nombre del
+# régimen (texto libre, p.ej. "Régimen de Sueldos y Salarios e Ingresos
+# Asimilados a Salarios") seguido de su fecha de inicio. Se ancla a los
+# encabezados de la tabla y se toma el texto hasta la primera fecha
+# (DD/MM/AAAA) como el nombre del régimen, en vez de una lista fija de
+# nombres posibles (el SAT tiene varios regímenes y el contribuyente puede
+# estar en cualquiera).
+PATRON_REGIMEN_CSF = re.compile(
+    r"REGIMEN(?:ES)?\s*:?\s*REGIMEN\s*FECHA\s*INICIO\s*FECHA\s*FIN\s*(.+?)\s*\d{2}/\d{2}/\d{4}"
+)
+
+
+def extraer_regimen_csf(texto_completo):
+    """Extrae el nombre del Régimen impreso en la hoja 2 de la CSF, bajo la
+    sección "Regímenes". Regresa el texto del régimen detectado o None si no
+    se encontró la tabla esperada."""
+    m = PATRON_REGIMEN_CSF.search(normaliza(texto_completo))
+    return m.group(1).strip() if m else None
+
+
+# Número de crédito (Infonavit y Fonacot): etiqueta "Número de crédito"
+# seguida de una secuencia de dígitos. En Infonavit aparece limpio bajo el
+# apartado "Información del crédito del trabajador"; en Fonacot el
+# formulario es más variado (a veces la tabla superior no se lee bien por
+# OCR), pero el propio documento repite la etiqueta de forma clara más
+# adelante ("...corresponde al número de crédito 17507"), así que se busca
+# en todo el texto y se toma la primera coincidencia clara.
+PATRON_NUMERO_CREDITO = re.compile(r"NUMERO\s*DE\s*CREDITO\s*:?\s*(\d{4,12})\b")
+
+# Respaldo específico para Fonacot: en fotos/escaneos de calidad pareja el
+# OCR a veces lee mal justo la palabra "CREDITO" de esa frase (p.ej.
+# "CRODIO", "NURNERO DE CREDITO") aunque el resto de la frase y, sobre
+# todo, los DÍGITOS del número salgan bien en las 4 combinaciones de
+# preprocesado probadas. Por eso este patrón se ancla en "CORRESPONDE AL"
+# (estable en las pruebas) y tolera hasta 5 palabras cualesquiera antes de
+# los dígitos, en vez de exigir que "NUMERO DE CREDITO" se haya leído
+# perfecto.
+PATRON_NUMERO_CREDITO_FONACOT_ALT = re.compile(r"CORRESPONDE AL(?:\s+\S+){0,5}?\s+(\d{4,12})\b")
+
+
+def extraer_numero_credito(texto_completo, etiqueta_seccion=None, admite_respaldo_fonacot=False):
+    """Extrae el "Número de crédito" del texto. Si se da etiqueta_seccion
+    (p.ej. "INFORMACION DEL CREDITO DEL TRABAJADOR" para Infonavit), primero
+    recorta el texto a partir de esa etiqueta para evitar falsos positivos;
+    si no se da (Fonacot), busca en todo el documento. Si
+    admite_respaldo_fonacot=True y no se encontró nada con el patrón
+    principal, se intenta también PATRON_NUMERO_CREDITO_FONACOT_ALT (ver su
+    comentario). Regresa el número detectado (como texto, para no perder
+    ceros a la izquierda) o None."""
+    t = normaliza(texto_completo)
+    if etiqueta_seccion:
+        idx = t.find(normaliza(etiqueta_seccion))
+        if idx != -1:
+            t = t[idx:]
+    m = PATRON_NUMERO_CREDITO.search(t)
+    if m:
+        return m.group(1)
+    if admite_respaldo_fonacot:
+        m_alt = PATRON_NUMERO_CREDITO_FONACOT_ALT.search(t)
+        if m_alt:
+            return m_alt.group(1)
+    return None
 
 
 def busca_fecha_nacimiento(texto):
@@ -831,6 +1033,24 @@ def analiza_csf(paginas_texto):
     else:
         obs.append("No se detectó un RFC con el formato esperado junto a la etiqueta 'RFC'; revisar manualmente.")
 
+    curp = extraer_curp(texto_completo)
+    if curp:
+        obs.append(f"CURP detectado: {curp}.")
+    else:
+        obs.append("No se detectó un CURP con el formato esperado en la CSF; revisar manualmente.")
+
+    codigo_postal = extraer_codigo_postal_csf(texto_completo)
+    if codigo_postal:
+        obs.append(f"Código Postal detectado: {codigo_postal}.")
+    else:
+        obs.append("No se detectó el Código Postal junto a la etiqueta 'Código Postal'; revisar manualmente.")
+
+    regimen = extraer_regimen_csf(texto_completo)
+    if regimen:
+        obs.append(f"Régimen detectado (hoja 2): {regimen}.")
+    else:
+        obs.append("No se detectó la tabla de 'Regímenes' (hoja 2) con el formato esperado; revisar manualmente.")
+
     # el PDF de la CSF a veces pierde los espacios entre palabras al extraer texto
     # ("Estatusenelpadrón:ACTIVO"), así que probamos con y sin espacios.
     m_estatus = re.search(r"ESTATUS\s*EN\s*EL\s*PADRON\s*:?\s*([A-Z]+)", t_norm)
@@ -879,6 +1099,9 @@ def analiza_csf(paginas_texto):
         "estatus": estatus,
         "activo": estatus == "ACTIVO",
         "rfc": rfc,
+        "curp": curp,
+        "codigo_postal": codigo_postal,
+        "regimen": regimen,
         "fecha_emision": emision_fecha,
         "dentro_3_meses": dentro_3_meses,
         "num_paginas_ok": len(paginas_texto) >= 2,
@@ -1071,6 +1294,9 @@ def procesar_documento(ruta, nombre_candidato, categoria_forzada=None):
         fila["vigencia_fecha_texto"] = r["fecha_emision"].isoformat() if r["fecha_emision"] else None
         fila["estatus_sat"] = r["estatus"]
         fila["rfc"] = r["rfc"]
+        fila["curp"] = r["curp"]
+        fila["codigo_postal"] = r["codigo_postal"]
+        fila["regimen"] = r["regimen"]
         detalles_extra.append(r["observaciones"])
         if not r["num_paginas_ok"]:
             detalles_extra.append("Falta la segunda hoja de la CSF en este PDF (debe traer ambas en 1 solo archivo).")
@@ -1082,6 +1308,42 @@ def procesar_documento(ruta, nombre_candidato, categoria_forzada=None):
             detalles_extra.append(f"CURP detectado: {curp}.")
         else:
             detalles_extra.append("No se detectó un CURP con el formato esperado (18 caracteres); revisar manualmente.")
+
+    elif clave == "FONACOT":
+        numero_credito = extraer_numero_credito(texto_completo, admite_respaldo_fonacot=True)
+        if not numero_credito:
+            # El pase rápido de OCR a veces lee mal justo la tabla angosta
+            # donde viene el número de crédito, aunque el resto del
+            # documento salga con buena confianza (ver _ocr_hd_forzado). Se
+            # prueban las 4 combinaciones del pase HD (no solo la de mayor
+            # confianza general): en la práctica los DÍGITOS del número
+            # salen estables en las 4, aunque la palabra "crédito" de la
+            # etiqueta salga mal leída justo en la de mayor confianza.
+            for texto_variante in _ocr_hd_forzado(ruta, indice_pagina=0, todas_las_variantes=True):
+                if not texto_variante:
+                    continue
+                numero_credito = extraer_numero_credito(texto_variante, admite_respaldo_fonacot=True)
+                if numero_credito:
+                    break
+        fila["numero_credito"] = numero_credito
+        if numero_credito:
+            detalles_extra.append(f"Número de crédito Fonacot detectado: {numero_credito}.")
+        else:
+            detalles_extra.append("No se detectó el número de crédito Fonacot; revisar manualmente.")
+
+    elif clave == "INFONAVIT":
+        numero_credito = extraer_numero_credito(texto_completo, etiqueta_seccion="INFORMACION DEL CREDITO DEL TRABAJADOR")
+        if not numero_credito:
+            texto_hd = _ocr_hd_forzado(ruta, indice_pagina=0)
+            if texto_hd:
+                numero_credito = extraer_numero_credito(texto_hd, etiqueta_seccion="INFORMACION DEL CREDITO DEL TRABAJADOR")
+        fila["numero_credito"] = numero_credito
+        if numero_credito:
+            detalles_extra.append(f"Número de crédito Infonavit detectado: {numero_credito}.")
+        else:
+            detalles_extra.append(
+                "No se detectó el número de crédito bajo 'Información del crédito del trabajador'; revisar manualmente."
+            )
 
     elif clave == "INE":
         # La vigencia SIEMPRE se revisa en la cara frontal (página 1) contra
@@ -1134,6 +1396,7 @@ def procesar_documento(ruta, nombre_candidato, categoria_forzada=None):
         detalles_extra.append(obs + " (regla de 5 años detectada como práctica común; confirmar si aplica formalmente).")
 
         fecha_nac = busca_fecha_nacimiento(texto_completo)
+        fila["fecha_nacimiento"] = fecha_nac
         fila["fecha_nacimiento_texto"] = fecha_nac.strftime("%d/%m/%Y") if fecha_nac else None
         if fecha_nac:
             detalles_extra.append(f"Fecha de nacimiento detectada: {fecha_nac.strftime('%d/%m/%Y')}.")
@@ -1272,7 +1535,11 @@ def _llenar_hoja_resumen(ws, candidato, filas, checklist, extra, fila_inicio=1):
     r0 = fila_inicio
     ws.cell(row=r0, column=1, value="Expediente de reclutamiento — validación automática").font = Font(bold=True, size=14)
     ws.cell(row=r0 + 1, column=1, value=f"Candidato: {candidato['nombre']}")
-    ws.cell(row=r0 + 2, column=1, value=f"RFC capturado: {candidato.get('rfc') or '—'}    CURP capturado: {candidato.get('curp') or '—'}")
+    ws.cell(row=r0 + 2, column=1, value=(
+        f"RFC capturado: {candidato.get('rfc') or '—'}    CURP capturado: {candidato.get('curp') or '—'}    "
+        f"E-mail: {candidato.get('email') or '—'}    Nacionalidad: {candidato.get('nacionalidad') or '—'}    "
+        f"Estado civil: {candidato.get('estado_civil') or '—'}    Teléfono: {candidato.get('telefono') or '—'}"
+    ))
     ws.cell(row=r0 + 3, column=1, value=f"Generado: {HOY.isoformat()}")
 
     faltantes = [c for c in checklist if c["obligatorio"] and not c["recibido"]]
@@ -1363,25 +1630,43 @@ def _llenar_hoja_resumen(ws, candidato, filas, checklist, extra, fila_inicio=1):
     acta_fila = next((f for f in filas if f["categoria_clave"] == "ACTA_NACIMIENTO"), None)
     domicilio_fila = next((f for f in filas if f["categoria_clave"] == "COMPROBANTE_DOMICILIO"), None)
     ine_fila = next((f for f in filas if f["categoria_clave"] == "INE"), None)
+    infonavit_fila = next((f for f in filas if f["categoria_clave"] == "INFONAVIT"), None)
+    fonacot_fila = next((f for f in filas if f["categoria_clave"] == "FONACOT"), None)
 
     r += 2
     ws.cell(row=r, column=1, value="Datos extraídos de los documentos (propuesta a confirmar contra el PDF):").font = Font(bold=True)
     r += 1
     _set_encabezados(ws, ["Dato", "Valor detectado", "Fuente"], fila=r)
     r += 1
+    def _dato(fila_doc, campo):
+        """(valor, sin_documento) — distingue "no se recibió el documento
+        fuente" (condicionales como Infonavit/Fonacot que pueden no aplicar)
+        de "se recibió pero no se pudo extraer el dato"."""
+        if fila_doc is None:
+            return None, True
+        return fila_doc.get(campo), False
+
     datos_extraidos = [
-        ("RFC", csf_fila.get("rfc") if csf_fila else None, "CSF"),
-        ("CURP", curp_fila.get("curp") if curp_fila else None, "Documento CURP"),
-        ("Fecha de nacimiento", acta_fila.get("fecha_nacimiento_texto") if acta_fila else None, "Acta de nacimiento"),
-        ("Dirección", domicilio_fila.get("direccion") if domicilio_fila else None, "Comprobante de domicilio"),
-        ("Dirección (INE)", ine_fila.get("direccion") if ine_fila else None, "INE"),
+        ("RFC", *_dato(csf_fila, "rfc"), "CSF"),
+        ("CURP", *_dato(curp_fila, "curp"), "Documento CURP"),
+        ("CURP (CSF)", *_dato(csf_fila, "curp"), "CSF"),
+        ("Código Postal (CSF)", *_dato(csf_fila, "codigo_postal"), "CSF"),
+        ("Régimen (CSF, hoja 2)", *_dato(csf_fila, "regimen"), "CSF"),
+        ("Fecha de nacimiento", *_dato(acta_fila, "fecha_nacimiento_texto"), "Acta de nacimiento"),
+        ("Dirección", *_dato(domicilio_fila, "direccion"), "Comprobante de domicilio"),
+        ("Dirección (INE)", *_dato(ine_fila, "direccion"), "INE"),
+        ("Número de crédito Infonavit", *_dato(infonavit_fila, "numero_credito"), "Infonavit"),
+        ("Número de crédito Fonacot", *_dato(fonacot_fila, "numero_credito"), "Fonacot"),
     ]
-    for etiqueta, valor, fuente in datos_extraidos:
+    for etiqueta, valor, sin_documento, fuente in datos_extraidos:
         ws.cell(row=r, column=1, value=etiqueta)
-        c_valor = ws.cell(row=r, column=2, value=valor or "No detectado")
-        c_valor.number_format = "@"  # forzar texto: RFC/CURP no deben interpretarse como número
-        if not valor:
-            c_valor.fill = AMARILLO
+        if sin_documento:
+            ws.cell(row=r, column=2, value="No se recibió el documento")
+        else:
+            c_valor = ws.cell(row=r, column=2, value=valor or "No detectado")
+            c_valor.number_format = "@"  # forzar texto: RFC/CURP no deben interpretarse como número
+            if not valor:
+                c_valor.fill = AMARILLO
         ws.cell(row=r, column=3, value=fuente)
         r += 1
 
@@ -1473,11 +1758,207 @@ def _llenar_hoja_detalle(ws, filas, fila_inicio=1):
     return r
 
 
+# ---------------------------------------------------------------------------
+# Tercera hoja: "Datos completos" — misma plantilla de alta en nómina/RH que
+# usa Fitness Para Todos (columnas y notas de origen tomadas tal cual de su
+# archivo de plantilla), precargada con lo que ya se puede derivar de los
+# documentos y del formulario. NO sustituye el alta real: los campos
+# operativos (puesto, club, salario, fechas de contrato, etc.) los sigue
+# llenando RH a mano, porque esos datos no vienen en ningún documento del
+# candidato ni en este formulario.
+# ---------------------------------------------------------------------------
+
+# (encabezado, nota de origen tal como la trae la plantilla de RH, o None si
+# esa columna no traía nota). Se excluyen de la plantilla original una
+# columna en blanco y unos valores de referencia sueltos al final (UMA, IMSS)
+# que no son campos por candidato.
+CAMPOS_DATOS_COMPLETOS = [
+    ("Estatus", None),
+    ("Número de empleado", None),
+    ("Nombres", None),
+    ("Apellido paterno", None),
+    ("Apellido materno", None),
+    ("Nombre completo en Worky", None),
+    ("CURP", "Se obtiene del CURP"),
+    ("RFC", "Se obtiene de CSF"),
+    ("Número seguridad social", "Se obtiene de Asignación de IMSS"),
+    ("Nombre fiscal", "Se obtiene de la constancia de situación fiscal"),
+    ("RETENCIÓN INFONAVIT", "se obtiene del aviso de retencion INFONAVIT"),
+    ("RETENCIÓN FONACOT", "se obtiene del aviso de retencion FONACOT"),
+    ("Régimen fiscal", "Se obtiene de la constancia de situación fiscal"),
+    ("C.P. fiscal", "Se obtiene de la constancia de situación fiscal"),
+    ("Género", "Se obtiene de CURP"),
+    ("Estado de nacimiento", "Se obtiene de CURP"),
+    ("Nacionalidad", "Se obtiene de CURP"),
+    ("Fecha de nacimiento", None),
+    ("Edad", None),
+    ("Estado civil", None),
+    ("Correo personal", None),
+    ("Correo corporativo", None),
+    ("Teléfono", None),
+    ("Calle", "Se obtiene del comprobante de domicilio"),
+    ("Número exterior", None),
+    ("Número interior", None),
+    ("CP", None),
+    ("Estado", None),
+    ("Municipio", None),
+    ("Colonia", None),
+    ("País", None),
+    ("DIRECCION FISCAL", "Se obtiene de CSF"),
+    ("Método de pago", None),
+    ("Banco", "Se obtiene de estado de cuenta"),
+    ("Número de cuenta", None),
+    ("Número de cuenta Clabe", None),
+    ("Nombre de la empresa", None),
+    ("REGISTRO PATRONAL", None),
+    ("CI departamento", None),
+    ("Nombre departamento", None),
+    ("Nombre puesto", None),
+    ("DESCRIPTOR DE PUESTO", None),
+    ("FECHA DE INICIO (LETRA)", None),
+    ("Fecha de alta", None),
+    ("Fecha de antigüedad", None),
+    ("FECHA DE TERMINO", None),
+    ("FECHA DE TERMINO (2)", None),
+    ("Tipo de contrato", None),
+    ("Tipo de periodo", None),
+    ("Salario mensual", None),
+    ("Salario diario", None),
+    ("LETRA", None),
+    ("Factor de integración", None),
+    ("Salario integrado fijo", None),
+    ("Variable diaria", None),
+    ("Salario base cotización", None),
+    ("Días de aguinaldo", None),
+    ("Días de vacaciones", None),
+    ("Prima vacacional", None),
+    ("HORAS", None),
+    ("TIPO", None),
+    ("JORNADA", None),
+    ("UMA", None),
+]
+
+# Campos que deben exportarse como texto (number_format "@") para que Excel
+# no les quite ceros a la izquierda ni los pase a notación científica.
+_CAMPOS_DATOS_COMPLETOS_TEXTO = {
+    "CURP", "RFC", "Número seguridad social", "RETENCIÓN INFONAVIT", "RETENCIÓN FONACOT",
+    "C.P. fiscal", "CP", "Número de cuenta", "Número de cuenta Clabe", "Teléfono",
+}
+
+
+def _valores_datos_completos(candidato, filas):
+    """Arma {encabezado: (valor, es_propuesta)} con lo que se puede derivar
+    de los documentos ya procesados y de lo capturado en el formulario. Un
+    valor None se deja en blanco -es de RH completarlo a mano, no es un
+    error-. es_propuesta=True resalta la celda en amarillo (dato de OCR o
+    derivado, igual que el resto del Excel: "a confirmar contra el
+    documento"; False se usa para lo que el propio candidato/reclutador
+    capturó tal cual en el formulario, que no necesita ese resaltado."""
+    csf_fila = next((f for f in filas if f["categoria_clave"] == "CSF"), None)
+    curp_fila = next((f for f in filas if f["categoria_clave"] == "CURP"), None)
+    acta_fila = next((f for f in filas if f["categoria_clave"] == "ACTA_NACIMIENTO"), None)
+    domicilio_fila = next((f for f in filas if f["categoria_clave"] == "COMPROBANTE_DOMICILIO"), None)
+    ine_fila = next((f for f in filas if f["categoria_clave"] == "INE"), None)
+    infonavit_fila = next((f for f in filas if f["categoria_clave"] == "INFONAVIT"), None)
+    fonacot_fila = next((f for f in filas if f["categoria_clave"] == "FONACOT"), None)
+    cuenta_fila = next((f for f in filas if f["categoria_clave"] == "CUENTA_BANCARIA"), None)
+
+    curp = (curp_fila or {}).get("curp") or (csf_fila or {}).get("curp")
+    derivados = datos_derivados_de_curp(curp) if curp else {}
+
+    # Fecha de nacimiento: se prefiere la del acta de nacimiento (documento
+    # oficial, ya extraída con su propia etiqueta) y solo si no se recibió
+    # o no se pudo leer, se usa la que se deriva del CURP (AAMMDD + regla
+    # del diferenciador para el siglo, ver datos_derivados_de_curp). La
+    # edad se calcula igual en los dos casos, con una resta simple contra
+    # hoy.
+    fecha_nac = (acta_fila or {}).get("fecha_nacimiento")
+    fecha_nac_texto = (acta_fila or {}).get("fecha_nacimiento_texto")
+    if not fecha_nac and derivados.get("fecha_nacimiento"):
+        fecha_nac = derivados["fecha_nacimiento"]
+        fecha_nac_texto = fecha_nac.strftime("%d/%m/%Y")
+    edad = None
+    if fecha_nac:
+        edad = HOY.year - fecha_nac.year - ((HOY.month, HOY.day) < (fecha_nac.month, fecha_nac.day))
+
+    direccion = (domicilio_fila or {}).get("direccion") or (ine_fila or {}).get("direccion")
+    nacionalidad_manual = candidato.get("nacionalidad")
+
+    v = {}
+    v["Nombre completo en Worky"] = (candidato.get("nombre"), False)
+    v["CURP"] = (curp, True)
+    v["RFC"] = ((csf_fila or {}).get("rfc") or candidato.get("rfc") or None, True)
+    v["Nombre fiscal"] = (candidato.get("nombre"), True)
+    v["RETENCIÓN INFONAVIT"] = ((infonavit_fila or {}).get("numero_credito"), True)
+    v["RETENCIÓN FONACOT"] = ((fonacot_fila or {}).get("numero_credito"), True)
+    v["Régimen fiscal"] = ((csf_fila or {}).get("regimen"), True)
+    v["C.P. fiscal"] = ((csf_fila or {}).get("codigo_postal"), True)
+    v["Género"] = (derivados.get("genero"), True)
+    v["Estado de nacimiento"] = (derivados.get("estado_nacimiento"), True)
+    v["Nacionalidad"] = (nacionalidad_manual or derivados.get("nacionalidad"), not nacionalidad_manual)
+    v["Fecha de nacimiento"] = (fecha_nac_texto, True)
+    v["Edad"] = (edad, True)
+    v["Estado civil"] = (candidato.get("estado_civil"), False)
+    v["Correo personal"] = (candidato.get("email"), False)
+    v["Teléfono"] = (candidato.get("telefono"), False)
+    v["DIRECCION FISCAL"] = (direccion, True)
+    v["Banco"] = ((cuenta_fila or {}).get("banco"), True)
+    v["Número de cuenta"] = ((cuenta_fila or {}).get("numero_cuenta"), True)
+    v["Número de cuenta Clabe"] = ((cuenta_fila or {}).get("clabe"), True)
+    v["Nombre de la empresa"] = ("FITNESS PARA TODOS S. DE R.L. DE C.V.", True)
+    v["Método de pago"] = ("Transferencia Electrónica", True)
+    return v
+
+
+def _llenar_hoja_datos_completos(ws, candidato, filas, fila_inicio=1, ajustar_anchos=True):
+    """Escribe la hoja/bloque "Datos completos": encabezados de la plantilla
+    de RH (fila 1), su nota de origen tal cual la trae esa plantilla (fila
+    2, de referencia), y los valores propuestos para este candidato (fila
+    3). Regresa la siguiente fila libre, igual que las otras _llenar_hoja_*,
+    para poder reutilizarse tanto en el Excel individual (hoja propia) como
+    debajo del detalle en el Excel de lote (misma hoja del candidato)."""
+    r = fila_inicio
+    ws.cell(row=r, column=1, value=(
+        "Datos completos (mismos campos que la plantilla de alta en nómina/RH) — "
+        "propuesta a confirmar, no sustituye la revisión de RH."
+    )).font = Font(bold=True)
+    r += 2
+
+    _set_encabezados(ws, [c[0] for c in CAMPOS_DATOS_COMPLETOS], fila=r)
+    fila_encabezados = r
+    r += 1
+
+    for col, (_campo, nota) in enumerate(CAMPOS_DATOS_COMPLETOS, start=1):
+        if nota:
+            c = ws.cell(row=r, column=col, value=nota)
+            c.font = Font(italic=True, size=9, color="666666")
+            c.alignment = Alignment(wrap_text=True, vertical="top")
+    ws.row_dimensions[r].height = 28
+    r += 1
+
+    valores = _valores_datos_completos(candidato, filas)
+    for col, (campo, _nota) in enumerate(CAMPOS_DATOS_COMPLETOS, start=1):
+        valor, es_propuesta = valores.get(campo, (None, False))
+        if valor in (None, ""):
+            continue
+        c = ws.cell(row=r, column=col, value=valor)
+        if campo in _CAMPOS_DATOS_COMPLETOS_TEXTO:
+            c.number_format = "@"
+        if es_propuesta:
+            c.fill = AMARILLO
+    r += 1
+
+    if ajustar_anchos:
+        _autoancho(ws, [18] * len(CAMPOS_DATOS_COMPLETOS))
+    return r
+
+
 def generar_excel(candidato, filas, checklist, extra, ruta_salida):
-    """Un solo candidato -> 2 hojas (Resumen + Detalle por documento).
-    Es el mismo formato de siempre; el único cambio interno es que ahora
-    reutiliza _llenar_hoja_resumen / _llenar_hoja_detalle, que también usa
-    generar_excel_lote para la carga masiva."""
+    """Un solo candidato -> 3 hojas (Resumen + Detalle por documento + Datos
+    completos). Es el mismo formato de siempre; el único cambio interno es
+    que ahora reutiliza _llenar_hoja_resumen / _llenar_hoja_detalle /
+    _llenar_hoja_datos_completos, que también usa generar_excel_lote para la
+    carga masiva."""
     wb = Workbook()
     ws = wb.active
     ws.title = "Resumen"
@@ -1487,6 +1968,9 @@ def generar_excel(candidato, filas, checklist, extra, ruta_salida):
     ws2 = wb.create_sheet("Detalle por documento")
     _llenar_hoja_detalle(ws2, filas, fila_inicio=1)
     _autoancho(ws2, [30, 26, 9, 10, 12, 20, 12, 24, 22, 18, 20, 70])
+
+    ws3 = wb.create_sheet("Datos completos")
+    _llenar_hoja_datos_completos(ws3, candidato, filas, fila_inicio=1)
 
     wb.save(ruta_salida)
 
@@ -1565,12 +2049,17 @@ def generar_excel_lote(resultados, ruta_salida):
         ws = wb.create_sheet(nombre_hoja)
         r_libre = _llenar_hoja_resumen(ws, res["candidato"], res["filas"], res["checklist"], res["extra"], fila_inicio=1)
         r_libre += 1  # una fila de separación visual antes del detalle
-        _llenar_hoja_detalle(ws, res["filas"], fila_inicio=r_libre)
-        # El resumen (arriba) solo usa las columnas A-D, pero como el detalle
-        # (abajo, misma hoja) usa 12 columnas, el ancho de columna se define
-        # una sola vez para toda la hoja con los anchos del detalle -son los
-        # que necesitan más espacio (observaciones, fechas, etc.)-.
-        _autoancho(ws, [30, 26, 9, 10, 12, 20, 12, 24, 22, 18, 20, 70])
+        r_libre = _llenar_hoja_detalle(ws, res["filas"], fila_inicio=r_libre)
+        r_libre += 1  # una fila de separación visual antes de "Datos completos"
+        _llenar_hoja_datos_completos(ws, res["candidato"], res["filas"], fila_inicio=r_libre, ajustar_anchos=False)
+        # El resumen (arriba) solo usa las columnas A-D y el detalle usa 12;
+        # "Datos completos" (abajo del todo) usa hasta 63. El ancho de
+        # columna se define una sola vez para toda la hoja, combinando los
+        # anchos ya afinados del detalle con un ancho parejo para las
+        # columnas adicionales que solo usa "Datos completos".
+        anchos_detalle = [30, 26, 9, 10, 12, 20, 12, 24, 22, 18, 20, 70]
+        anchos = anchos_detalle + [18] * (len(CAMPOS_DATOS_COMPLETOS) - len(anchos_detalle))
+        _autoancho(ws, anchos)
 
     wb.save(ruta_salida)
 

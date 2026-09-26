@@ -129,7 +129,8 @@ CAMPOS_DOCUMENTOS = [
     ("csf", "CSF (ambos lados en 1 PDF)", True),
     ("nss", "NSS", True),
     ("cuenta_bancaria", "Cuenta bancaria (carátula)", True),
-    ("infonavit_fonacot", "Aviso de retención Infonavit/Fonacot", False),
+    ("infonavit", "Aviso de retención Infonavit", False),
+    ("fonacot", "Aviso de retención Fonacot", False),
     ("certificado_medico", "Certificado médico", False),
     ("certificado_instructor", "Certificado de entrenador / barbero / estilista", False),
     ("constancia_laboral", "Constancia(s) laboral(es)", False),
@@ -689,6 +690,22 @@ CONTENIDO_INDIVIDUAL = """
     <label>CURP (opcional)</label>
     <input type="text" name="curp">
   </div>
+  <div class="campo">
+    <label>E-mail (opcional)</label>
+    <input type="email" name="email">
+  </div>
+  <div class="campo">
+    <label>Nacionalidad (opcional)</label>
+    <input type="text" name="nacionalidad">
+  </div>
+  <div class="campo">
+    <label>Estado Civil (opcional)</label>
+    <input type="text" name="estado_civil">
+  </div>
+  <div class="campo">
+    <label>No. Teléfono (opcional)</label>
+    <input type="tel" name="telefono">
+  </div>
   {% for campo, etiqueta, obligatorio in documentos %}
   <div class="doc {{ 'req' if obligatorio else '' }}">
     <label>{{ etiqueta }} {% if not obligatorio %}<span class="tag">Opcional</span>{% endif %}</label>
@@ -1057,10 +1074,18 @@ def validar():
     nombre = request.form.get("nombre", "").strip()
     rfc = request.form.get("rfc", "").strip()
     curp = request.form.get("curp", "").strip()
+    email = request.form.get("email", "").strip()
+    nacionalidad = request.form.get("nacionalidad", "").strip()
+    estado_civil = request.form.get("estado_civil", "").strip()
+    telefono = request.form.get("telefono", "").strip()
     if not nombre:
         return "Falta el nombre del candidato", 400
 
-    candidato = {"nombre": nombre, "rfc": rfc, "curp": curp}
+    candidato = {
+        "nombre": nombre, "rfc": rfc, "curp": curp,
+        "email": email, "nacionalidad": nacionalidad,
+        "estado_civil": estado_civil, "telefono": telefono,
+    }
 
     # A diferencia de antes, aquí NO se usa `with tempfile.TemporaryDirectory()`
     # porque el directorio tiene que seguir existiendo mientras el generador
