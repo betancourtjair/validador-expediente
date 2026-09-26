@@ -683,28 +683,20 @@ CONTENIDO_INDIVIDUAL = """
     <input type="text" name="nombre" required>
   </div>
   <div class="campo">
-    <label>RFC (opcional)</label>
-    <input type="text" name="rfc">
+    <label>E-mail</label>
+    <input type="email" name="email" required>
   </div>
   <div class="campo">
-    <label>CURP (opcional)</label>
-    <input type="text" name="curp">
+    <label>Nacionalidad</label>
+    <input type="text" name="nacionalidad" required>
   </div>
   <div class="campo">
-    <label>E-mail (opcional)</label>
-    <input type="email" name="email">
+    <label>Estado Civil</label>
+    <input type="text" name="estado_civil" required>
   </div>
   <div class="campo">
-    <label>Nacionalidad (opcional)</label>
-    <input type="text" name="nacionalidad">
-  </div>
-  <div class="campo">
-    <label>Estado Civil (opcional)</label>
-    <input type="text" name="estado_civil">
-  </div>
-  <div class="campo">
-    <label>No. Teléfono (opcional)</label>
-    <input type="tel" name="telefono">
+    <label>No. Teléfono</label>
+    <input type="tel" name="telefono" required>
   </div>
   {% for campo, etiqueta, obligatorio in documentos %}
   <div class="doc {{ 'req' if obligatorio else '' }}">
@@ -1080,6 +1072,8 @@ def validar():
     telefono = request.form.get("telefono", "").strip()
     if not nombre:
         return "Falta el nombre del candidato", 400
+    if not (email and nacionalidad and estado_civil and telefono):
+        return "Faltan datos obligatorios del candidato (E-mail, Nacionalidad, Estado Civil o Teléfono)", 400
 
     candidato = {
         "nombre": nombre, "rfc": rfc, "curp": curp,

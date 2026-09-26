@@ -1536,7 +1536,6 @@ def _llenar_hoja_resumen(ws, candidato, filas, checklist, extra, fila_inicio=1):
     ws.cell(row=r0, column=1, value="Expediente de reclutamiento — validación automática").font = Font(bold=True, size=14)
     ws.cell(row=r0 + 1, column=1, value=f"Candidato: {candidato['nombre']}")
     ws.cell(row=r0 + 2, column=1, value=(
-        f"RFC capturado: {candidato.get('rfc') or '—'}    CURP capturado: {candidato.get('curp') or '—'}    "
         f"E-mail: {candidato.get('email') or '—'}    Nacionalidad: {candidato.get('nacionalidad') or '—'}    "
         f"Estado civil: {candidato.get('estado_civil') or '—'}    Teléfono: {candidato.get('telefono') or '—'}"
     ))
