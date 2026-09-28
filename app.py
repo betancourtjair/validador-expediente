@@ -90,6 +90,7 @@ def _cargar_usuarios_autorizados():
             "jessica.otamendi@fpt.com.mx": "PlanetFitness$01",
             "jair@fpt.com.mx": "PlanetFitness$01",
             "carmina.gonzalez@fpt.com.mx": "PlanetFitness$01",
+            "maria.loyde@fpt.com.mx": "PlanetFitness$01",
         }
     return usuarios
 
