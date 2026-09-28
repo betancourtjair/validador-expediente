@@ -686,6 +686,20 @@ def extraer_curp(texto_completo):
     return m.group(1) if m else None
 
 
+# Número de Seguridad Social (NSS): 11 dígitos, impreso en la constancia de
+# "Asignación de Número de Seguridad Social" del IMSS, junto a la etiqueta
+# "Número de Seguridad Social".
+PATRON_NSS = re.compile(r"NUMERO\s*DE\s*SEGURIDAD\s*SOCIAL\s*:?\s*(\d{11})\b")
+
+
+def extraer_nss(texto_completo):
+    """Extrae el Número de Seguridad Social del documento de "Asignación de
+    NSS" del IMSS, anclado a la etiqueta "Número de Seguridad Social".
+    Regresa el NSS detectado (11 dígitos) o None si no se encontró."""
+    m = PATRON_NSS.search(normaliza(texto_completo))
+    return m.group(1) if m else None
+
+
 # Códigos de entidad federativa que usa el CURP (posiciones 12-13), definidos
 # por RENAPO -no son los mismos que las abreviaturas postales comunes-. "NE"
 # es el código reservado para quien nació en el extranjero.
@@ -779,6 +793,84 @@ def extraer_regimen_csf(texto_completo):
     se encontró la tabla esperada."""
     m = PATRON_REGIMEN_CSF.search(normaliza(texto_completo))
     return m.group(1).strip() if m else None
+
+
+# Nombre(s), Primer y Segundo Apellido de la CSF: bajo "Datos de
+# Identificación del Contribuyente", en ese orden y cada uno con su propia
+# etiqueta ("Nombre (s):", "Primer Apellido:", "Segundo Apellido:"). Se
+# ancla cada campo a la etiqueta que le sigue, en vez de a un largo fijo,
+# porque el nombre y los apellidos pueden traer más de una palabra.
+PATRON_NOMBRES_CSF = re.compile(r"NOMBRE\s*\(S\)\s*:?\s*(.+?)\s*PRIMER\s*APELLIDO\s*:")
+PATRON_APELLIDO_PATERNO_CSF = re.compile(r"PRIMER\s*APELLIDO\s*:?\s*(.+?)\s*SEGUNDO\s*APELLIDO\s*:")
+PATRON_APELLIDO_MATERNO_CSF = re.compile(r"SEGUNDO\s*APELLIDO\s*:?\s*(.+?)\s*FECHA\s*INICIO\s*DE\s*OPERACIONES\s*:")
+
+
+def extraer_nombres_csf(texto_completo):
+    """Extrae el/los Nombre(s) impresos en la CSF, anclado entre la etiqueta
+    "Nombre (s):" y la etiqueta "Primer Apellido:" que le sigue. Regresa el
+    texto detectado o None si no se encontró."""
+    m = PATRON_NOMBRES_CSF.search(normaliza(texto_completo))
+    return (m.group(1).strip() or None) if m else None
+
+
+def extraer_apellido_paterno_csf(texto_completo):
+    """Extrae el Primer Apellido impreso en la CSF, anclado entre las
+    etiquetas "Primer Apellido:" y "Segundo Apellido:". Regresa el texto
+    detectado o None si no se encontró."""
+    m = PATRON_APELLIDO_PATERNO_CSF.search(normaliza(texto_completo))
+    return (m.group(1).strip() or None) if m else None
+
+
+def extraer_apellido_materno_csf(texto_completo):
+    """Extrae el Segundo Apellido impreso en la CSF, anclado entre la
+    etiqueta "Segundo Apellido:" y la etiqueta "Fecha inicio de
+    operaciones:" que le sigue en la plantilla del SAT. Regresa el texto
+    detectado o None si no se encontró (por ejemplo, si el contribuyente
+    solo tiene un apellido, ese renglón viene vacío en la CSF)."""
+    m = PATRON_APELLIDO_MATERNO_CSF.search(normaliza(texto_completo))
+    return (m.group(1).strip() or None) if m else None
+
+
+# El renglón "Nombre(s): ..." de arriba a veces pierde el espacio ENTRE
+# palabras del propio valor (p.ej. "Nombre(s): ALAMNARESH" en vez de "ALAM
+# NARESH") -es la extracción de texto del PDF la que junta esas dos
+# palabras si el hueco entre ellas es muy angosto en ese renglón en
+# particular, no un error de la expresión regular-. La CSF trae ese mismo
+# nombre bien espaciado en el encabezado, justo debajo de "Registro Federal
+# de Contribuyentes" (es el campo "Nombre, denominación o razón social" que
+# imprime la Cédula de Identificación Fiscal), así que se usa esa copia
+# como fuente preferida para el nombre completo, y de ahí se le quitan los
+# apellidos (ya extraídos aparte, sin ese problema porque son una sola
+# palabra) para quedarse solo con los Nombres, bien espaciados.
+PATRON_NOMBRE_COMPLETO_CSF_ENCABEZADO = re.compile(
+    r"REGISTRO\s*FEDERAL\s*DE\s*CONTRIBUYENTES\s*(.+?)\s*NOMBRE\s*,\s*DENOMINACION\s*O\s*RAZON"
+)
+
+
+def extraer_nombre_completo_csf_encabezado(texto_completo):
+    """Extrae el nombre completo tal como lo imprime el encabezado de la
+    Cédula de Identificación Fiscal (bien espaciado, a diferencia del
+    renglón "Nombre(s):" de más abajo). Regresa el texto detectado o None
+    si no se encontró ese encabezado."""
+    m = PATRON_NOMBRE_COMPLETO_CSF_ENCABEZADO.search(normaliza(texto_completo))
+    return (m.group(1).strip() or None) if m else None
+
+
+def extraer_nombres_csf_bien_espaciado(texto_completo, apellido_paterno, apellido_materno):
+    """Nombres(s) de la CSF, evitando el problema de espacio perdido descrito
+    arriba: parte del nombre completo bien espaciado del encabezado y le
+    quita los apellidos (segundo y luego primero) del final. Si ese
+    encabezado no se encontró, cae de vuelta a extraer_nombres_csf (el
+    renglón "Nombre(s):", que puede venir con las palabras pegadas si el
+    nombre trae más de una)."""
+    nombre_completo = extraer_nombre_completo_csf_encabezado(texto_completo)
+    if nombre_completo:
+        for apellido in (apellido_materno, apellido_paterno):
+            if apellido and nombre_completo.upper().endswith(" " + apellido.upper()):
+                nombre_completo = nombre_completo[: -len(apellido)].rstrip()
+        if nombre_completo:
+            return nombre_completo
+    return extraer_nombres_csf(texto_completo)
 
 
 # Número de crédito (Infonavit y Fonacot): etiqueta "Número de crédito"
@@ -1051,6 +1143,20 @@ def analiza_csf(paginas_texto):
     else:
         obs.append("No se detectó la tabla de 'Regímenes' (hoja 2) con el formato esperado; revisar manualmente.")
 
+    apellido_paterno = extraer_apellido_paterno_csf(texto_completo)
+    apellido_materno = extraer_apellido_materno_csf(texto_completo)
+    nombres = extraer_nombres_csf_bien_espaciado(texto_completo, apellido_paterno, apellido_materno)
+    if nombres or apellido_paterno or apellido_materno:
+        obs.append(
+            "Nombre(s)/Apellidos detectados en la CSF: "
+            f"{nombres or '—'} / {apellido_paterno or '—'} / {apellido_materno or '—'}."
+        )
+    else:
+        obs.append(
+            "No se detectaron Nombre(s)/Primer Apellido/Segundo Apellido junto a esas etiquetas en la CSF; "
+            "revisar manualmente."
+        )
+
     # el PDF de la CSF a veces pierde los espacios entre palabras al extraer texto
     # ("Estatusenelpadrón:ACTIVO"), así que probamos con y sin espacios.
     m_estatus = re.search(r"ESTATUS\s*EN\s*EL\s*PADRON\s*:?\s*([A-Z]+)", t_norm)
@@ -1102,6 +1208,9 @@ def analiza_csf(paginas_texto):
         "curp": curp,
         "codigo_postal": codigo_postal,
         "regimen": regimen,
+        "nombres": nombres,
+        "apellido_paterno": apellido_paterno,
+        "apellido_materno": apellido_materno,
         "fecha_emision": emision_fecha,
         "dentro_3_meses": dentro_3_meses,
         "num_paginas_ok": len(paginas_texto) >= 2,
@@ -1297,6 +1406,9 @@ def procesar_documento(ruta, nombre_candidato, categoria_forzada=None):
         fila["curp"] = r["curp"]
         fila["codigo_postal"] = r["codigo_postal"]
         fila["regimen"] = r["regimen"]
+        fila["nombres"] = r["nombres"]
+        fila["apellido_paterno"] = r["apellido_paterno"]
+        fila["apellido_materno"] = r["apellido_materno"]
         detalles_extra.append(r["observaciones"])
         if not r["num_paginas_ok"]:
             detalles_extra.append("Falta la segunda hoja de la CSF en este PDF (debe traer ambas en 1 solo archivo).")
@@ -1308,6 +1420,16 @@ def procesar_documento(ruta, nombre_candidato, categoria_forzada=None):
             detalles_extra.append(f"CURP detectado: {curp}.")
         else:
             detalles_extra.append("No se detectó un CURP con el formato esperado (18 caracteres); revisar manualmente.")
+
+    elif clave == "NSS":
+        nss = extraer_nss(texto_completo)
+        fila["numero_seguridad_social"] = nss
+        if nss:
+            detalles_extra.append(f"Número de Seguridad Social detectado: {nss}.")
+        else:
+            detalles_extra.append(
+                "No se detectó el Número de Seguridad Social (11 dígitos) junto a esa etiqueta; revisar manualmente."
+            )
 
     elif clave == "FONACOT":
         numero_credito = extraer_numero_credito(texto_completo, admite_respaldo_fonacot=True)
@@ -1861,6 +1983,7 @@ def _valores_datos_completos(candidato, filas):
     infonavit_fila = next((f for f in filas if f["categoria_clave"] == "INFONAVIT"), None)
     fonacot_fila = next((f for f in filas if f["categoria_clave"] == "FONACOT"), None)
     cuenta_fila = next((f for f in filas if f["categoria_clave"] == "CUENTA_BANCARIA"), None)
+    nss_fila = next((f for f in filas if f["categoria_clave"] == "NSS"), None)
 
     curp = (curp_fila or {}).get("curp") or (csf_fila or {}).get("curp")
     derivados = datos_derivados_de_curp(curp) if curp else {}
@@ -1883,8 +2006,29 @@ def _valores_datos_completos(candidato, filas):
     direccion = (domicilio_fila or {}).get("direccion") or (ine_fila or {}).get("direccion")
     nacionalidad_manual = candidato.get("nacionalidad")
 
+    # Nombre(s)/Apellidos: se prefieren los que trae la CSF (documento
+    # oficial, ya separados en sus 3 campos) para armar el "Nombre completo
+    # en Worky" uniéndolos en ese orden (Nombres + Apellido paterno +
+    # Apellido materno); si la CSF no se recibió o no se pudo leer ese
+    # bloque, se cae de vuelta al nombre tal cual lo capturó el candidato en
+    # el formulario -que es lo que hacía este campo antes de tener la CSF
+    # separada en Nombres/Apellidos-.
+    nombres_csf = (csf_fila or {}).get("nombres")
+    apellido_paterno_csf = (csf_fila or {}).get("apellido_paterno")
+    apellido_materno_csf = (csf_fila or {}).get("apellido_materno")
+    if nombres_csf and apellido_paterno_csf:
+        nombre_worky = " ".join(p for p in (nombres_csf, apellido_paterno_csf, apellido_materno_csf) if p)
+        nombre_worky_es_propuesta = True
+    else:
+        nombre_worky = candidato.get("nombre")
+        nombre_worky_es_propuesta = False
+
     v = {}
-    v["Nombre completo en Worky"] = (candidato.get("nombre"), False)
+    v["Nombres"] = (nombres_csf, True)
+    v["Apellido paterno"] = (apellido_paterno_csf, True)
+    v["Apellido materno"] = (apellido_materno_csf, True)
+    v["Nombre completo en Worky"] = (nombre_worky, nombre_worky_es_propuesta)
+    v["Número seguridad social"] = ((nss_fila or {}).get("numero_seguridad_social"), True)
     v["CURP"] = (curp, True)
     v["RFC"] = ((csf_fila or {}).get("rfc") or candidato.get("rfc") or None, True)
     v["Nombre fiscal"] = (candidato.get("nombre"), True)
