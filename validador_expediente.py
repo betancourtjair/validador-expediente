@@ -93,7 +93,24 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
-HOY = datetime.date.today()
+try:
+    from zoneinfo import ZoneInfo
+    _ZONA_CDMX = ZoneInfo("America/Mexico_City")
+except Exception:
+    # Si por algún motivo el contenedor no trae la base de datos de zonas
+    # horarias (IANA tzdata), no queremos que la app truene: seguimos con la
+    # fecha del sistema (normalmente UTC) en vez de la de CDMX.
+    _ZONA_CDMX = None
+
+# "Hoy", pero en la zona horaria de Ciudad de México (no la del contenedor,
+# que en Cloud Run corre en UTC) — de aquí salen tanto la fecha que se
+# imprime en "Generado: ..." como todos los cálculos de vigencia/antigüedad
+# (días vencidos, edad, etc.) que usan HOY en este archivo.
+HOY = (
+    datetime.datetime.now(_ZONA_CDMX).date()
+    if _ZONA_CDMX is not None
+    else datetime.date.today()
+)
 
 # ---------------------------------------------------------------------------
 # Utilidades de texto

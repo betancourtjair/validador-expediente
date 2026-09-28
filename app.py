@@ -64,6 +64,28 @@ from flask import Flask, request, render_template_string, Response, stream_with_
 
 import validador_expediente as ve
 
+try:
+    from zoneinfo import ZoneInfo
+    _ZONA_CDMX = ZoneInfo("America/Mexico_City")
+except Exception:
+    # Si el contenedor no trae la base de datos de zonas horarias (IANA
+    # tzdata), no queremos que la app truene: se muestra la hora tal cual
+    # (normalmente UTC) en vez de la de CDMX.
+    _ZONA_CDMX = None
+
+
+def _a_hora_cdmx(fecha):
+    """Convierte un datetime a la hora local de Ciudad de México, para
+    mostrarlo en pantalla (columna "Generado" de /descargas). Si el datetime
+    no trae zona horaria (naive), se asume que es UTC -que es como corre el
+    contenedor en Cloud Run- antes de convertir."""
+    if fecha is None or not hasattr(fecha, "tzinfo") or _ZONA_CDMX is None:
+        return fecha
+    if fecha.tzinfo is None:
+        fecha = fecha.replace(tzinfo=datetime.timezone.utc)
+    return fecha.astimezone(_ZONA_CDMX)
+
+
 app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
@@ -933,7 +955,7 @@ def formulario_lote():
 def descargas():
     archivos = listar_expedientes_individuales()
     for item in archivos:
-        fecha = item.get("fecha")
+        fecha = _a_hora_cdmx(item.get("fecha"))
         item["fecha_texto"] = fecha.strftime("%d/%m/%Y %H:%M") if hasattr(fecha, "strftime") else str(fecha)
     return render_template_string(
         _envolver_pagina("descargas", "Documentos — Validador de Expediente", CONTENIDO_DESCARGAS),
