@@ -791,6 +791,132 @@ def extraer_codigo_postal_csf(texto_completo):
     return m.group(1) if m else None
 
 
+def _campo_csf_por_regex(t_norm, patron_etiqueta, patrones_fin, ventana=250):
+    """Como una versión de _campo_entre_etiquetas que tolera que la
+    extracción del PDF haya pegado las palabras de la etiqueta sin espacio
+    entre ellas -el mismo fenómeno ya documentado en otros campos de la CSF,
+    ver extraer_nombres_csf_bien_espaciado más abajo, y que en esta sección
+    de "Datos del domicilio registrado" resultó afectar a la mayoría de las
+    etiquetas-: 'patron_etiqueta' y cada elemento de 'patrones_fin' son
+    expresiones regulares (normalmente con \\s* entre palabras, que también
+    matchea CERO espacios) en vez de texto literal.
+
+    Regresa el texto que sigue a la etiqueta, cortado en la primera
+    coincidencia de cualquiera de 'patrones_fin' (se prueban todas y se usa
+    la que aparezca más cerca); si ninguna aparece, se recorta a 120
+    caracteres como respaldo. None si la etiqueta de inicio no se
+    encontró."""
+    m = re.search(patron_etiqueta, t_norm)
+    if not m:
+        return None
+    resto = t_norm[m.end():m.end() + ventana]
+    fin = 120
+    for patron_fin in patrones_fin:
+        m_fin = re.search(patron_fin, resto)
+        if m_fin and m_fin.start() < fin:
+            fin = m_fin.start()
+    return resto[:fin].strip(" :.-\t")
+
+
+_CSF_ETQ_TIPO_VIALIDAD = r"TIPO\s*DE\s*VIALIDAD"
+_CSF_ETQ_NOMBRE_VIALIDAD = r"NOMBRE\s*DE\s*VIALIDAD"
+_CSF_ETQ_NUMERO_EXTERIOR = r"NUMERO\s*EXTERIOR"
+_CSF_ETQ_NUMERO_INTERIOR = r"NUMERO\s*INTERIOR"
+_CSF_ETQ_COLONIA = r"NOMBRE\s*DE\s*LA\s*COLONIA"
+_CSF_ETQ_LOCALIDAD = r"NOMBRE\s*DE\s*LA\s*LOCALIDAD"
+_CSF_ETQ_MUNICIPIO = r"NOMBRE\s*DEL\s*MUNICIPIO\s*O\s*DEMARCACION\s*TERRITORIAL"
+_CSF_ETQ_ENTIDAD = r"NOMBRE\s*DE\s*LA\s*ENTIDAD\s*FEDERATIVA"
+_CSF_ETQ_ENTRE_CALLE = r"ENTRE\s*CALLE"
+_CSF_ETQ_Y_CALLE = r"Y\s*CALLE"
+_CSF_ETQ_FIN_SECCION = r"ACTIVIDADES\s*ECONOMICAS|REGIMENES"
+
+
+def extraer_domicilio_csf(texto_completo):
+    """Extrae los campos de la sección "Datos del domicilio registrado" de
+    la CSF (Tipo/Nombre de Vialidad, Número Exterior/Interior, Colonia,
+    Localidad, Municipio, Entidad Federativa) y arma con ellos, junto con
+    el Código Postal (ver extraer_codigo_postal_csf), una "Dirección
+    fiscal" legible en una sola línea para la hoja "Datos completos".
+
+    Cuando "Nombre de la Colonia" trae un nombre largo (de fraccionamiento)
+    que ocupa 2 renglones en el PDF, la extracción de texto a veces
+    intercala ahí en medio la etiqueta "Número Interior" -con su valor,
+    casi siempre vacío- porque en el PDF esa etiqueta está en la columna de
+    al lado, a la altura del primer renglón de la Colonia. Por eso la
+    Colonia se captura sin cortar en esa etiqueta (para no perder el
+    segundo renglón) y luego se le quita, si quedó pegada adentro; y el
+    "Número Interior" en sí solo se acepta si el texto capturado de veras
+    parece un número interior (empieza con dígito, o es un texto corto tipo
+    "PB"/"A") -si no, se descarta como el residuo de la Colonia que
+    probablemente es, y se deja en blanco (a revisar a mano) en vez de
+    asignarle por error un pedazo del nombre de la Colonia.
+
+    Regresa un dict con cada campo por separado (código_postal, tipo/
+    nombre de vialidad, número exterior/interior, colonia, localidad,
+    municipio, entidad_federativa) y la llave 'direccion_fiscal' con el
+    texto ya armado; si no se encontró la sección, todo queda en None."""
+    t = normaliza(texto_completo)
+
+    tipo_vialidad = _campo_csf_por_regex(t, _CSF_ETQ_TIPO_VIALIDAD, [_CSF_ETQ_NOMBRE_VIALIDAD])
+    nombre_vialidad = _campo_csf_por_regex(t, _CSF_ETQ_NOMBRE_VIALIDAD, [_CSF_ETQ_NUMERO_EXTERIOR])
+    numero_exterior = _campo_csf_por_regex(
+        t, _CSF_ETQ_NUMERO_EXTERIOR, [_CSF_ETQ_NUMERO_INTERIOR, _CSF_ETQ_COLONIA]
+    )
+
+    colonia_bruta = _campo_csf_por_regex(t, _CSF_ETQ_COLONIA, [_CSF_ETQ_LOCALIDAD])
+    colonia = None
+    if colonia_bruta is not None:
+        colonia = re.sub(_CSF_ETQ_NUMERO_INTERIOR + r"\s*:?\s*", " ", colonia_bruta)
+        colonia = re.sub(r"\s+", " ", colonia).strip(" ,") or None
+
+    numero_interior_bruto = _campo_csf_por_regex(
+        t, _CSF_ETQ_NUMERO_INTERIOR, [_CSF_ETQ_COLONIA, _CSF_ETQ_LOCALIDAD]
+    )
+    numero_interior = None
+    if numero_interior_bruto and re.match(r"^(?:[0-9][0-9A-Z\-\.]{0,9}|[A-Z]{1,2})$", numero_interior_bruto):
+        numero_interior = numero_interior_bruto
+
+    localidad = _campo_csf_por_regex(t, _CSF_ETQ_LOCALIDAD, [_CSF_ETQ_MUNICIPIO])
+    municipio = _campo_csf_por_regex(t, _CSF_ETQ_MUNICIPIO, [_CSF_ETQ_ENTIDAD])
+    entidad = _campo_csf_por_regex(
+        t, _CSF_ETQ_ENTIDAD, [_CSF_ETQ_ENTRE_CALLE, _CSF_ETQ_Y_CALLE, _CSF_ETQ_FIN_SECCION]
+    )
+    codigo_postal = extraer_codigo_postal_csf(texto_completo)
+
+    resultado = {
+        "codigo_postal": codigo_postal,
+        "tipo_vialidad": tipo_vialidad or None,
+        "nombre_vialidad": nombre_vialidad or None,
+        "numero_exterior": numero_exterior or None,
+        "numero_interior": numero_interior or None,
+        "colonia": colonia or None,
+        "localidad": localidad or None,
+        "municipio": municipio or None,
+        "entidad_federativa": entidad or None,
+        "direccion_fiscal": None,
+    }
+
+    if not any([tipo_vialidad, nombre_vialidad, numero_exterior, colonia, municipio, entidad, codigo_postal]):
+        return resultado
+
+    calle = " ".join(p for p in (tipo_vialidad, nombre_vialidad) if p)
+    numero = numero_exterior or ""
+    if numero_interior:
+        numero = f"{numero} Int. {numero_interior}".strip()
+    fragmento_calle = " ".join(p for p in (calle, numero) if p)
+
+    piezas = [
+        fragmento_calle or None,
+        f"Col. {colonia}" if colonia else None,
+        localidad if localidad and localidad != municipio else None,
+        municipio,
+        entidad,
+        f"C.P. {codigo_postal}" if codigo_postal else None,
+    ]
+    resultado["direccion_fiscal"] = ", ".join(p for p in piezas if p).strip(", ") or None
+    return resultado
+
+
 # Régimen de la CSF: en la hoja 2, bajo la sección "Regímenes", una tabla con
 # encabezados "Régimen | Fecha Inicio | Fecha Fin" y debajo el nombre del
 # régimen (texto libre, p.ej. "Régimen de Sueldos y Salarios e Ingresos
@@ -1013,6 +1139,164 @@ def extraer_direccion(texto_completo, etiquetas, ventana=220, max_lineas=4):
     return None
 
 
+# Nombres/abreviaturas de los 32 estados de México, tal como suelen
+# aparecer impresos al final de una dirección (INE, comprobante de
+# domicilio). Se usan SOLO para reconocer cuál pedazo de la dirección es
+# el Estado (para poder separar el Municipio, que va justo antes); el
+# texto que se guarda en la columna "Estado" siempre es el original tal
+# como lo trae el documento (abreviado o completo), nunca esta lista.
+ESTADOS_MEXICO_ALIAS = {
+    "AGUASCALIENTES", "AGS",
+    "BAJA CALIFORNIA", "BC", "BCN",
+    "BAJA CALIFORNIA SUR", "BCS",
+    "CAMPECHE", "CAMP",
+    "CIUDAD DE MEXICO", "CDMX", "DISTRITO FEDERAL", "DF",
+    "COAHUILA", "COAH", "COAHUILA DE ZARAGOZA",
+    "COLIMA", "COL",
+    "CHIAPAS", "CHIS",
+    "CHIHUAHUA", "CHIH",
+    "DURANGO", "DGO",
+    "GUANAJUATO", "GTO",
+    "GUERRERO", "GRO",
+    "HIDALGO", "HGO",
+    "JALISCO", "JAL",
+    "ESTADO DE MEXICO", "EDOMEX", "EDO MEX", "EDO DE MEXICO",
+    "MICHOACAN", "MICH", "MICHOACAN DE OCAMPO",
+    "MORELOS", "MOR",
+    "NAYARIT", "NAY",
+    "NUEVO LEON", "NL",
+    "OAXACA", "OAX",
+    "PUEBLA", "PUE",
+    "QUERETARO", "QRO",
+    "QUINTANA ROO", "QROO", "Q ROO",
+    "SAN LUIS POTOSI", "SLP",
+    "SINALOA", "SIN",
+    "SONORA", "SON",
+    "TABASCO", "TAB",
+    "TAMAULIPAS", "TAMPS",
+    "TLAXCALA", "TLAX",
+    "VERACRUZ", "VER", "VERACRUZ DE IGNACIO DE LA LLAVE",
+    "YUCATAN", "YUC",
+    "ZACATECAS", "ZAC",
+}
+
+
+def _es_estado_mexico(texto_normalizado):
+    """True si 'texto_normalizado' (mayúsculas, sin acentos) es -tal cual o
+    quitándole un punto final- uno de los nombres/abreviaturas de estado en
+    ESTADOS_MEXICO_ALIAS."""
+    return texto_normalizado.rstrip(".").strip() in ESTADOS_MEXICO_ALIAS
+
+
+def descomponer_direccion(direccion):
+    """Best-effort: separa una dirección de una sola línea -como la que
+    regresa extraer_direccion, con cada renglón del documento unido por
+    ", "- en sus componentes (Calle, Número exterior, Número interior,
+    Colonia, Municipio, Estado, Código Postal) para las columnas de la
+    hoja "Datos completos".
+
+    No existe un formato único de domicilio en México (a diferencia del
+    RFC o el CURP), así que esto SIEMPRE es una propuesta a confirmar
+    contra el documento original -por eso, igual que el resto de "Datos
+    completos", se resalta en amarillo-, nunca un dato ya verificado.
+    Cualquier campo que no se pudo reconocer queda en None; el Código
+    Postal en particular solo se reconoce si viene junto a la etiqueta
+    "C.P."/"CP" (un INE normalmente no trae código postal impreso en el
+    domicilio, así que ahí quedará en blanco: no se adivina de un número
+    suelto de 5 dígitos para no confundirlo con un número exterior).
+
+    Regresa un dict con las llaves calle, numero_exterior,
+    numero_interior, colonia, municipio, estado y codigo_postal."""
+    resultado = {
+        "calle": None, "numero_exterior": None, "numero_interior": None,
+        "colonia": None, "municipio": None, "estado": None, "codigo_postal": None,
+    }
+    if not direccion:
+        return resultado
+
+    texto = direccion
+
+    m_cp = re.search(r"C\.?\s*P\.?\s*:?\s*(\d{5})\b", texto, flags=re.IGNORECASE)
+    if m_cp:
+        resultado["codigo_postal"] = m_cp.group(1)
+        texto = (texto[:m_cp.start()] + texto[m_cp.end():]).strip(" ,")
+
+    # "México" como país no se necesita aislar aquí (va en su propia
+    # columna, con un valor fijo); se quita si aparece suelto al final
+    # para que no se confunda con el Estado.
+    texto = re.sub(r",?\s*M[EÉ]XICO\s*$", "", texto, flags=re.IGNORECASE).strip(" ,")
+
+    partes = [p.strip() for p in texto.split(",") if p.strip()]
+    if not partes:
+        return resultado
+
+    idx_estado = None
+    estado_texto = None
+    municipio_de_ultimo_segmento = None
+
+    for i in (len(partes) - 1, len(partes) - 2):
+        if i < 0:
+            continue
+        segmento = partes[i]
+        if _es_estado_mexico(normaliza(segmento)):
+            idx_estado, estado_texto = i, segmento
+            break
+        palabras = segmento.split()
+        encontrado = False
+        for n in (3, 2, 1):
+            if len(palabras) > n:  # > n: que siempre quede algo de municipio
+                cola = " ".join(palabras[-n:])
+                if _es_estado_mexico(normaliza(cola)):
+                    idx_estado, estado_texto = i, cola
+                    municipio_de_ultimo_segmento = " ".join(palabras[:-n])
+                    encontrado = True
+                    break
+        if encontrado:
+            break
+
+    resultado["estado"] = estado_texto
+
+    if idx_estado is not None:
+        if municipio_de_ultimo_segmento:
+            resultado["municipio"] = municipio_de_ultimo_segmento or None
+            resto = partes[:idx_estado]
+        else:
+            resto = partes[:idx_estado]
+            if resto:
+                resultado["municipio"] = resto[-1]
+                resto = resto[:-1]
+    else:
+        # No se reconoció ningún estado: se asume, como respaldo, que el
+        # último pedazo ya es el Municipio (p.ej. una alcaldía de CDMX que
+        # no trae el estado explícito en el domicilio).
+        resto = partes[:-1]
+        if partes:
+            resultado["municipio"] = partes[-1]
+
+    primero = None
+    if resto:
+        primero = resto[0]
+        if len(resto) > 1:
+            resultado["colonia"] = ", ".join(resto[1:])
+
+    if primero:
+        # El número interior (si viene pegado en la misma línea, p.ej. "AV
+        # REFORMA 100 INT 4B") se separa ANTES que el exterior: si no, el
+        # exterior se lo llevaría por error (es el que queda más a la
+        # derecha del renglón).
+        m_int = re.search(r"\bINT(?:ERIOR)?\.?\s*([A-Za-z0-9\-]+)$", primero, flags=re.IGNORECASE)
+        if m_int:
+            resultado["numero_interior"] = m_int.group(1)
+            primero = primero[:m_int.start()].strip(" ,.-")
+        palabras = primero.split()
+        if len(palabras) >= 2 and re.match(r"^\d+[A-Za-z]?$", palabras[-1]):
+            resultado["numero_exterior"] = palabras[-1]
+            primero = " ".join(palabras[:-1])
+        resultado["calle"] = primero or None
+
+    return resultado
+
+
 CODIGOS_CLABE_BANCOS = {
     "002": "Banamex/Citibanamex", "006": "Bancomext", "009": "Banobras",
     "012": "BBVA México", "014": "Santander", "019": "Banjercito",
@@ -1154,6 +1438,15 @@ def analiza_csf(paginas_texto):
     else:
         obs.append("No se detectó el Código Postal junto a la etiqueta 'Código Postal'; revisar manualmente.")
 
+    domicilio = extraer_domicilio_csf(texto_completo)
+    if domicilio["direccion_fiscal"]:
+        obs.append(f"Dirección fiscal armada con los datos del domicilio registrado: {domicilio['direccion_fiscal']}.")
+    else:
+        obs.append(
+            "No se detectó la sección 'Datos del domicilio registrado' con el formato esperado; "
+            "revisar manualmente la Dirección fiscal."
+        )
+
     regimen = extraer_regimen_csf(texto_completo)
     if regimen:
         obs.append(f"Régimen detectado (hoja 2): {regimen}.")
@@ -1224,6 +1517,7 @@ def analiza_csf(paginas_texto):
         "rfc": rfc,
         "curp": curp,
         "codigo_postal": codigo_postal,
+        "direccion_fiscal": domicilio["direccion_fiscal"],
         "regimen": regimen,
         "nombres": nombres,
         "apellido_paterno": apellido_paterno,
@@ -1422,6 +1716,7 @@ def procesar_documento(ruta, nombre_candidato, categoria_forzada=None):
         fila["rfc"] = r["rfc"]
         fila["curp"] = r["curp"]
         fila["codigo_postal"] = r["codigo_postal"]
+        fila["direccion_fiscal"] = r["direccion_fiscal"]
         fila["regimen"] = r["regimen"]
         fila["nombres"] = r["nombres"]
         fila["apellido_paterno"] = r["apellido_paterno"]
@@ -1495,6 +1790,7 @@ def procesar_documento(ruta, nombre_candidato, categoria_forzada=None):
         detalles_extra.append(r["observaciones"])
         direccion_ine = extraer_direccion(texto_completo, ["DOMICILIO"])
         fila["direccion"] = direccion_ine
+        fila["domicilio"] = descomponer_direccion(direccion_ine)
         if direccion_ine:
             detalles_extra.append(f"Dirección detectada en el INE (revisar contra el documento): {direccion_ine}")
         else:
@@ -1510,6 +1806,7 @@ def procesar_documento(ruta, nombre_candidato, categoria_forzada=None):
             "DIRECCION DEL SERVICIO", "DOMICILIO DE INSTALACION", "DOMICILIO",
         ])
         fila["direccion"] = direccion_domicilio
+        fila["domicilio"] = descomponer_direccion(direccion_domicilio)
         if direccion_domicilio:
             detalles_extra.append(f"Dirección detectada en el comprobante de domicilio (revisar contra el documento): {direccion_domicilio}")
         else:
@@ -2020,7 +2317,17 @@ def _valores_datos_completos(candidato, filas):
     if fecha_nac:
         edad = HOY.year - fecha_nac.year - ((HOY.month, HOY.day) < (fecha_nac.month, fecha_nac.day))
 
-    direccion = (domicilio_fila or {}).get("direccion") or (ine_fila or {}).get("direccion")
+    # "DIRECCION FISCAL" es el domicilio registrado ante el SAT (de la CSF),
+    # no la dirección particular del candidato -son datos distintos, aunque
+    # a veces coincidan-. Las columnas Calle/Número/Colonia/Municipio/
+    # Estado/CP/País, en cambio, sí son la dirección particular: se prefiere
+    # la del INE (más clara y homogénea) y, si no se recibió o no se pudo
+    # reconocer nada en ella, se cae de vuelta a la del comprobante de
+    # domicilio. Ver descomponer_direccion() para las limitaciones de este
+    # reconocimiento (siempre una propuesta a confirmar).
+    domicilio_ine = (ine_fila or {}).get("domicilio") or {}
+    domicilio_comprobante = (domicilio_fila or {}).get("domicilio") or {}
+    domicilio_particular = domicilio_ine if any(domicilio_ine.values()) else domicilio_comprobante
     nacionalidad_manual = candidato.get("nacionalidad")
 
     # Nombre(s)/Apellidos: se prefieren los que trae la CSF (documento
@@ -2061,7 +2368,15 @@ def _valores_datos_completos(candidato, filas):
     v["Estado civil"] = (candidato.get("estado_civil"), False)
     v["Correo personal"] = (candidato.get("email"), False)
     v["Teléfono"] = (candidato.get("telefono"), False)
-    v["DIRECCION FISCAL"] = (direccion, True)
+    v["Calle"] = (domicilio_particular.get("calle"), True)
+    v["Número exterior"] = (domicilio_particular.get("numero_exterior"), True)
+    v["Número interior"] = (domicilio_particular.get("numero_interior"), True)
+    v["CP"] = (domicilio_particular.get("codigo_postal"), True)
+    v["Estado"] = (domicilio_particular.get("estado"), True)
+    v["Municipio"] = (domicilio_particular.get("municipio"), True)
+    v["Colonia"] = (domicilio_particular.get("colonia"), True)
+    v["País"] = ("México" if (ine_fila or domicilio_fila) else None, True)
+    v["DIRECCION FISCAL"] = ((csf_fila or {}).get("direccion_fiscal"), True)
     v["Banco"] = ((cuenta_fila or {}).get("banco"), True)
     v["Número de cuenta"] = ((cuenta_fila or {}).get("numero_cuenta"), True)
     v["Número de cuenta Clabe"] = ((cuenta_fila or {}).get("clabe"), True)

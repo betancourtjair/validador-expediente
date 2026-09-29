@@ -986,7 +986,7 @@ def _evento_sse(datos_dict):
     return "data: " + json.dumps(datos_dict, ensure_ascii=False) + "\n\n"
 
 
-def _generar_eventos_validacion(tmp, rutas, candidato):
+def _generar_eventos_validacion(tmp, rutas, candidato, categoria_por_ruta=None):
     """Generador que hace todo el trabajo (OCR + Excel) y va cediendo (yield)
     un evento de progreso por cada documento, todo DENTRO de la misma
     petición HTTP de /validar (por eso se manda como Server-Sent Events en
@@ -1008,7 +1008,17 @@ def _generar_eventos_validacion(tmp, rutas, candidato):
     subidos, igual que antes hacía `tempfile.TemporaryDirectory()` — nomás
     que aquí se hace a mano en el "finally" porque ya no se usa ese context
     manager (el directorio tiene que seguir vivo mientras dura el generador).
+
+    'categoria_por_ruta' (opcional) es un dict {ruta: clave_de_CATEGORIAS}
+    para forzar la categoría de un documento en vez de dejar que
+    ve.procesar_documento la adivine por contenido -así ya sabemos, porque
+    el candidato lo subió en el campo "Cuenta bancaria (carátula)", que ESE
+    archivo es la cuenta bancaria, aunque el texto que se alcance a leer no
+    traiga ninguna de las palabras clave esperadas-. Una ruta que no esté en
+    el dict (p.ej. los archivos subidos en "otros") se sigue clasificando
+    por contenido, como antes.
     """
+    categoria_por_ruta = categoria_por_ruta or {}
     nombre = candidato["nombre"]
     total = len(rutas) + 1  # +1 = paso final de generar el Excel
     hecho = 0
@@ -1023,7 +1033,7 @@ def _generar_eventos_validacion(tmp, rutas, candidato):
             yield _evento_sse({"tipo": "progreso", "hecho": hecho, "total": total, "archivo_actual": nombre_doc})
             print(f"[validar]   procesando {nombre_doc} ...", file=sys.stderr, flush=True)
             try:
-                fila = ve.procesar_documento(ruta, nombre)
+                fila = ve.procesar_documento(ruta, nombre, categoria_forzada=categoria_por_ruta.get(ruta))
             except Exception as e:
                 fila = {
                     "archivo": nombre_doc, "categoria_clave": "ERROR",
@@ -1115,12 +1125,25 @@ def validar():
     tmp = tempfile.mkdtemp(prefix="expediente_")
     try:
         rutas = []
+        # Cada campo del formulario (CAMPOS_DOCUMENTOS) ya nos dice de qué
+        # documento se trata -el candidato lo subió específicamente en el
+        # campo "Cuenta bancaria (carátula)", "CSF", etc.-, así que se guarda
+        # esa categoría por adelantado en vez de dejar que más adelante se
+        # adivine solo por el contenido del PDF (ver categoria_por_ruta en
+        # _generar_eventos_validacion): si el OCR/texto de ese archivo en
+        # particular no trae ninguna de las palabras clave esperadas, antes
+        # se quedaba sin clasificar (y sin los datos de esa categoría en el
+        # Excel) aunque el candidato lo hubiera subido en el campo correcto.
+        # Los archivos de "otros" no tienen un campo/categoría conocida, así
+        # que esos sí se siguen clasificando por contenido, como antes.
+        categoria_por_ruta = {}
         for campo, _etiqueta, _ob in CAMPOS_DOCUMENTOS:
             f = request.files.get(campo)
             if f and f.filename:
                 ruta = os.path.join(tmp, f.filename)
                 f.save(ruta)
                 rutas.append(ruta)
+                categoria_por_ruta[ruta] = campo.upper()
         for f in request.files.getlist("otros"):
             if f and f.filename:
                 ruta = os.path.join(tmp, f.filename)
@@ -1135,7 +1158,7 @@ def validar():
         return f"Ocurrió un error recibiendo los documentos: {e}", 500
 
     respuesta = Response(
-        stream_with_context(_generar_eventos_validacion(tmp, rutas, candidato)),
+        stream_with_context(_generar_eventos_validacion(tmp, rutas, candidato, categoria_por_ruta)),
         mimetype="text/event-stream",
     )
     # Evita que algún proxy intermedio (nginx, el balanceador de Render/Cloud
