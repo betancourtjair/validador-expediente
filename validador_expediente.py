@@ -1648,7 +1648,53 @@ def analiza_csf(paginas_texto):
     }
 
 
-def analiza_ine(paginas_texto):
+def _ocr_vigencia_ine(ruta):
+    """Reintento localizado, solo para el renglón de Vigencia de la cara
+    frontal del INE: se usa cuando el texto que ya se extrajo (ver
+    extraer_texto_pdf) no trajo dos años legibles junto a "VIGENCIA".
+
+    Ese renglón ("FECHA DE NACIMIENTO / SECCIÓN / VIGENCIA") suele ir
+    impreso sobre un fondo de color (mapa de México, franjas) que un
+    umbral de binarización calculado con el brillo de TODA la credencial
+    -como hace _preprocesa_para_ocr- no necesariamente separa bien: puede
+    quedar bien para el resto del documento y mal justo ahí. Aquí se
+    recorta solo el tercio inferior de la imagen incrustada (donde
+    siempre va esa fila) y se calcula el umbral con el brillo de ESE
+    recorte, probando varios factores -no uno solo- y quedándose con la
+    primera combinación que efectivamente encuentra "VIGENCIA" seguida de
+    2 años, en vez de la de mayor confianza general (aquí solo importa
+    acertar ese campo puntual).
+
+    Regresa el texto reconocido (para que analiza_ine lo procese con la
+    misma lógica de siempre) o None si ninguna combinación funcionó."""
+    try:
+        imagenes = _extraer_imagenes_incrustadas(ruta, 0)
+    except Exception:
+        imagenes = []
+    if not imagenes:
+        return None
+    frente = imagenes[0]
+    ancho, alto = frente.size
+    recorte = frente.crop((0, int(alto * 0.65), ancho, alto))
+    gris = ImageOps.autocontrast(ImageOps.grayscale(recorte), cutoff=0)
+    brillo = ImageStat.Stat(gris).mean[0]
+    for factor in (0.7, 0.85, 1.0):
+        umbral = brillo * factor
+        binaria = gris.point(lambda x, u=umbral: 255 if x > u else 0)
+        candidata = binaria.filter(ImageFilter.SHARPEN)
+        for psm in ("6", "3"):
+            try:
+                texto, _ = _ocr_con_confianza(candidata, lang="spa", config=f"--psm {psm}")
+            except Exception:
+                texto = ""
+            t_norm = normaliza(texto)
+            idx = t_norm.find("VIGENCIA")
+            if idx != -1 and len(re.findall(r"\b(19\d{2}|20\d{2})\b", t_norm[idx: idx + 80])) >= 2:
+                return texto
+    return None
+
+
+def analiza_ine(paginas_texto, ruta=None):
     obs = []
 
     dos_paginas = len(paginas_texto) >= 2
@@ -1668,22 +1714,42 @@ def analiza_ine(paginas_texto):
     # (números de sección, caracteres mal leídos), así que buscamos los dos
     # años (19xx/20xx) más cercanos después de la palabra VIGENCIA en vez de
     # exigir que estén pegados a ella.
+    def _busca_vigencia(texto_norm):
+        idx = texto_norm.find("VIGENCIA")
+        if idx == -1:
+            return None
+        anios = re.findall(r"\b(19\d{2}|20\d{2})\b", texto_norm[idx: idx + 80])
+        if len(anios) < 2:
+            return None
+        return int(anios[-2]), int(anios[-1])
+
+    encontrada = _busca_vigencia(t_norm)
+    recuperada_con_reintento = False
+    # Ese renglón suele ir sobre un fondo de color que un umbral de
+    # binarización global (calculado con el brillo de TODA la credencial)
+    # no siempre separa bien; si no se encontró aquí, vale la pena un
+    # reintento localizado sobre esa franja antes de rendirse (ver
+    # _ocr_vigencia_ine). Solo se hace cuando de verdad hace falta -no en
+    # cada INE- porque implica volver a rasterizar/OCR-ear.
+    if encontrada is None and ruta:
+        texto_retry = _ocr_vigencia_ine(ruta)
+        if texto_retry:
+            encontrada = _busca_vigencia(normaliza(texto_retry))
+            recuperada_con_reintento = encontrada is not None
+
     vigente = None
     anio_fin = None
-    idx = t_norm.find("VIGENCIA")
-    if idx != -1:
-        ventana = t_norm[idx: idx + 80]
-        anios = re.findall(r"\b(19\d{2}|20\d{2})\b", ventana)
-        if len(anios) >= 2:
-            anio_inicio, anio_fin = int(anios[-2]), int(anios[-1])
-            vigente = anio_fin >= HOY.year
-            dias_para_vencer = (datetime.date(anio_fin, 12, 31) - HOY).days
-            if vigente:
-                obs.append(f"Vigencia impresa en la cara frontal: {anio_inicio}-{anio_fin} (vigente hoy {HOY.isoformat()}).")
-            else:
-                obs.append(f"Vigencia impresa en la cara frontal: {anio_inicio}-{anio_fin} — VENCIDA (venció hace {abs(dias_para_vencer)} días respecto a hoy {HOY.isoformat()}).")
+    if encontrada:
+        anio_inicio, anio_fin = encontrada
+        vigente = anio_fin >= HOY.year
+        dias_para_vencer = (datetime.date(anio_fin, 12, 31) - HOY).days
+        sufijo = " (recuperada con un reintento localizado sobre ese renglón)" if recuperada_con_reintento else ""
+        if vigente:
+            obs.append(f"Vigencia impresa en la cara frontal: {anio_inicio}-{anio_fin} (vigente hoy {HOY.isoformat()}){sufijo}.")
         else:
-            obs.append("Se encontró la palabra VIGENCIA en la cara frontal pero no dos años legibles junto a ella; revisar manualmente.")
+            obs.append(f"Vigencia impresa en la cara frontal: {anio_inicio}-{anio_fin} — VENCIDA (venció hace {abs(dias_para_vencer)} días respecto a hoy {HOY.isoformat()}){sufijo}.")
+    elif t_norm.find("VIGENCIA") != -1:
+        obs.append("Se encontró la palabra VIGENCIA en la cara frontal pero no dos años legibles junto a ella; revisar manualmente.")
     else:
         obs.append("No se detectó el campo de vigencia en la cara frontal; revisar manualmente.")
 
@@ -1902,7 +1968,7 @@ def procesar_documento(ruta, nombre_candidato, categoria_forzada=None):
         # La vigencia SIEMPRE se revisa en la cara frontal (página 1) contra
         # la fecha de hoy; que el PDF traiga ambas caras solo se checa por
         # separado (num_paginas_ok) para no mezclar los dos criterios.
-        r = analiza_ine(paginas_texto)
+        r = analiza_ine(paginas_texto, ruta=ruta)
         fila["vigencia_ok"] = r["vigente"]
         fila["vigencia_fecha_texto"] = f"Vigente hasta {r['vigencia_anio_fin']}" if r["vigencia_anio_fin"] else None
         fila["num_paginas_ok"] = r["dos_paginas"]
