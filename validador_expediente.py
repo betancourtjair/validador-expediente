@@ -79,6 +79,7 @@ en el sistema los binarios `tesseract` (con el paquete de idioma `spa`) y
 
 import argparse
 import datetime
+import io
 import os
 import re
 import sys
@@ -87,7 +88,7 @@ import zipfile
 
 import pdfplumber
 from pdf2image import convert_from_path
-from PIL import ImageOps, ImageStat, ImageFilter
+from PIL import Image, ImageOps, ImageStat, ImageFilter
 import pytesseract
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
@@ -333,6 +334,81 @@ def _corrige_rotacion(imagen):
     return imagen
 
 
+def _extraer_imagenes_incrustadas(ruta, indice_pagina):
+    """Extrae, tal cual, las imágenes que ya vienen incrustadas en el PDF
+    para esa página (JPEG/PNG originales) -sin volver a renderizar la
+    página completa con poppler.
+
+    Se descubrió con un caso real (INE fotografiada/escaneada e insertada
+    como imagen en el PDF) que renderizar la página vía convert_from_path
+    (aunque sea a 300 dpi) puede salir con MENOS calidad para el OCR que
+    la imagen original: el remuestreo/recompresión de poppler, sumado al
+    autocontraste, puede volver el fondo decorativo de una credencial
+    (mapa de México, patrón de fondo) casi indistinguible del texto,
+    mientras que Tesseract lee bien la imagen JPEG original tal cual.
+    Por eso esto se usa como una candidata MÁS a competir por confianza
+    junto a los pases de poppler, nunca como reemplazo directo (hay PDFs
+    sin imágenes incrustadas -texto nativo-, o con imágenes en formatos
+    que no se pueden decodificar aquí).
+
+    Se descartan imágenes muy chicas (sellos/logos) porque no traen el
+    contenido principal del documento. Regresa una lista de imágenes PIL
+    en RGB, ordenadas de arriba hacia abajo según su posición en la
+    página (para páginas con más de una imagen, p.ej. anverso y reverso
+    de una credencial escaneados juntos)."""
+    imagenes = []
+    try:
+        with pdfplumber.open(ruta) as pdf:
+            if indice_pagina >= len(pdf.pages):
+                return []
+            pagina = pdf.pages[indice_pagina]
+            candidatas = sorted(pagina.images, key=lambda im: im.get("top", 0))
+            for im in candidatas:
+                ancho, alto = im.get("srcsize", (0, 0))
+                if ancho < 200 or alto < 200:
+                    continue
+                try:
+                    datos = im["stream"].get_data()
+                    imagen = Image.open(io.BytesIO(datos)).convert("RGB")
+                    imagenes.append(imagen)
+                except Exception:
+                    continue
+    except Exception:
+        return []
+    return imagenes
+
+
+def _ocr_imagenes_incrustadas(ruta, indice_pagina, lang="spa", config="--psm 3"):
+    """OCR directo (sin preprocesar) sobre las imágenes incrustadas de la
+    página -ver _extraer_imagenes_incrustadas-. Si hay varias (anverso y
+    reverso en la misma página), se corre OCR por separado en cada una y
+    se concatena el texto; la confianza reportada es el promedio
+    ponderado por longitud de texto de cada imagen, para que se pueda
+    comparar contra las demás candidatas del pase HD con el mismo
+    criterio (mayor confianza gana). Regresa (texto, confianza); texto
+    vacío y confianza -1.0 si no hay imágenes o ninguna se pudo leer."""
+    imagenes = _extraer_imagenes_incrustadas(ruta, indice_pagina)
+    if not imagenes:
+        return "", -1.0
+    textos = []
+    for imagen in imagenes:
+        try:
+            texto, confianza = _ocr_con_confianza(imagen, lang=lang, config=config)
+        except Exception:
+            texto, confianza = "", -1.0
+        if texto:
+            textos.append((texto, confianza))
+    if not textos:
+        return "", -1.0
+    texto_completo = "\n".join(t for t, _ in textos)
+    peso_total = sum(len(t) for t, _ in textos)
+    if peso_total <= 0:
+        confianza_prom = max(c for _, c in textos)
+    else:
+        confianza_prom = sum(len(t) * c for t, c in textos) / peso_total
+    return texto_completo, confianza_prom
+
+
 def extraer_texto_pdf(ruta):
     """Regresa (lista_de_texto_por_pagina, num_paginas, uso_ocr_por_pagina).
 
@@ -410,50 +486,75 @@ def extraer_texto_pdf(ruta):
                 reintentar.append(i)
 
         for i in reintentar:
-            try:
-                imagenes_pagina_hd = convert_from_path(
-                    ruta, dpi=300, first_page=i + 1, last_page=i + 1, grayscale=True
-                )
-            except Exception as e:
-                imagenes_pagina_hd = []
-                print(f"  [aviso] no se pudo rasterizar en HD la página {i+1} para OCR ({e})", file=sys.stderr)
-            if not imagenes_pagina_hd:
-                continue
-            imagen_hd = _corrige_rotacion(imagenes_pagina_hd[0])
-            del imagenes_pagina_hd
-
             mejor_texto, mejor_confianza = paginas_texto[i], -1.0
             mejoro = False
             terminar = False
+
+            # Candidata adicional (y la más barata: no rasteriza la página):
+            # OCR directo sobre la(s) imagen(es) tal como vienen incrustadas
+            # en el PDF (ver _extraer_imagenes_incrustadas). En documentos
+            # escaneados de una sola imagen -típico en fotos de INE o
+            # comprobante de domicilio- esto en la práctica gana casi
+            # siempre contra los pases de poppler de abajo, porque no
+            # arrastra el remuestreo/recompresión de volver a rasterizar la
+            # página completa. Se prueba primero: si ya sale confiable, se
+            # evita de plano rasterizar en HD.
+            for psm in ("3", "6"):
+                try:
+                    candidato, confianza = _ocr_imagenes_incrustadas(ruta, i, config=f"--psm {psm}")
+                except Exception as e:
+                    candidato, confianza = "", -1.0
+                    print(f"  [aviso] OCR (imagen incrustada, psm {psm}) falló en página {i+1} ({e})", file=sys.stderr)
+                if candidato and len(candidato) >= 20 and confianza > mejor_confianza:
+                    mejor_texto, mejor_confianza = candidato, confianza
+                    mejoro = True
+                if mejor_confianza >= 75 and len(mejor_texto) >= 40:
+                    terminar = True
+                    break
+
             # Se prueban dos variantes de preprocesamiento (con y sin
             # binarizar — binarizar ayuda mucho con fondos de color pero en
             # documentos de fondo claro a veces borra más de lo que ayuda),
             # UNA A LA VEZ (no las dos en memoria simultáneamente), cada una
             # con dos configuraciones de segmentación de Tesseract, y se
             # elige la de mayor confianza reportada por el propio Tesseract
-            # (no la primera que salga ni la más larga).
-            for nivel in ("ligero", "fuerte"):
-                imagen_candidata = _preprocesa_para_ocr(imagen_hd, nivel=nivel)
-                for psm in ("3", "6"):
-                    try:
-                        candidato, confianza = _ocr_con_confianza(
-                            imagen_candidata, lang="spa", config=f"--psm {psm}"
-                        )
-                    except Exception as e:
-                        candidato, confianza = "", -1.0
-                        print(f"  [aviso] OCR (HD, psm {psm}) falló en página {i+1} ({e})", file=sys.stderr)
-                    if candidato and len(candidato) >= 20 and confianza > mejor_confianza:
-                        mejor_texto, mejor_confianza = candidato, confianza
-                        mejoro = True
-                    # Ya se ve confiable y con longitud razonable: no vale la
-                    # pena seguir probando más configuraciones.
-                    if mejor_confianza >= 75 and len(mejor_texto) >= 40:
-                        terminar = True
-                        break
-                del imagen_candidata
-                if terminar:
-                    break
-            del imagen_hd
+            # (no la primera que salga ni la más larga). Solo se llega aquí
+            # -y solo se rasteriza en HD- si la imagen incrustada no bastó.
+            if not terminar:
+                try:
+                    imagenes_pagina_hd = convert_from_path(
+                        ruta, dpi=300, first_page=i + 1, last_page=i + 1, grayscale=True
+                    )
+                except Exception as e:
+                    imagenes_pagina_hd = []
+                    print(f"  [aviso] no se pudo rasterizar en HD la página {i+1} para OCR ({e})", file=sys.stderr)
+                imagen_hd = _corrige_rotacion(imagenes_pagina_hd[0]) if imagenes_pagina_hd else None
+                del imagenes_pagina_hd
+
+                if imagen_hd is not None:
+                    for nivel in ("ligero", "fuerte"):
+                        imagen_candidata = _preprocesa_para_ocr(imagen_hd, nivel=nivel)
+                        for psm in ("3", "6"):
+                            try:
+                                candidato, confianza = _ocr_con_confianza(
+                                    imagen_candidata, lang="spa", config=f"--psm {psm}"
+                                )
+                            except Exception as e:
+                                candidato, confianza = "", -1.0
+                                print(f"  [aviso] OCR (HD, psm {psm}) falló en página {i+1} ({e})", file=sys.stderr)
+                            if candidato and len(candidato) >= 20 and confianza > mejor_confianza:
+                                mejor_texto, mejor_confianza = candidato, confianza
+                                mejoro = True
+                            # Ya se ve confiable y con longitud razonable: no
+                            # vale la pena seguir probando más configuraciones.
+                            if mejor_confianza >= 75 and len(mejor_texto) >= 40:
+                                terminar = True
+                                break
+                        del imagen_candidata
+                        if terminar:
+                            break
+                    del imagen_hd
+
             if mejoro:
                 paginas_texto[i] = mejor_texto
                 ocr_usado[i] = True
@@ -1200,10 +1301,11 @@ def descomponer_direccion(direccion):
     contra el documento original -por eso, igual que el resto de "Datos
     completos", se resalta en amarillo-, nunca un dato ya verificado.
     Cualquier campo que no se pudo reconocer queda en None; el Código
-    Postal en particular solo se reconoce si viene junto a la etiqueta
-    "C.P."/"CP" (un INE normalmente no trae código postal impreso en el
-    domicilio, así que ahí quedará en blanco: no se adivina de un número
-    suelto de 5 dígitos para no confundirlo con un número exterior).
+    Postal se reconoce junto a la etiqueta "C.P."/"CP" o, en su defecto,
+    como número suelto de 5 dígitos al final del renglón de la Colonia
+    (formato común en el INE, que casi nunca imprime la etiqueta "C.P."
+    pero sí el número) -nunca se adivina de un domicilio de un solo
+    renglón, para no confundirlo con un Número exterior largo.
 
     Regresa un dict con las llaves calle, numero_exterior,
     numero_interior, colonia, municipio, estado y codigo_postal."""
@@ -1272,6 +1374,23 @@ def descomponer_direccion(direccion):
         resto = partes[:-1]
         if partes:
             resultado["municipio"] = partes[-1]
+
+    # Muchas credenciales de INE sí traen el Código Postal, pero SIN la
+    # etiqueta "C.P.": va pegado como número suelto de 5 dígitos al final
+    # del renglón de la Colonia (p.ej. "FRACC SIAN KAAN V 97314"). Esto
+    # solo se acepta cuando la Colonia viene en su propio renglón (resto
+    # con 2+ pedazos): así no se confunde con un Número exterior de 5
+    # dígitos en domicilios de un solo renglón (calle+número), donde un
+    # número exterior tan largo sería rarísimo pero no imposible.
+    if resultado["codigo_postal"] is None and len(resto) >= 2:
+        m_cp_suelto = re.search(r"(?<!\d)(\d{5})\s*$", resto[-1])
+        if m_cp_suelto:
+            resultado["codigo_postal"] = m_cp_suelto.group(1)
+            recorte = resto[-1][:m_cp_suelto.start()].strip(" ,.-")
+            if recorte:
+                resto[-1] = recorte
+            else:
+                resto = resto[:-1]
 
     primero = None
     if resto:
