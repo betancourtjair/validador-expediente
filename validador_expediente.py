@@ -878,13 +878,13 @@ def _ocr_hd_forzado(ruta, indice_pagina=0, todas_las_variantes=False):
 
 # clave -> (nombre legible, lista de palabras/frases clave, es obligatorio)
 CATEGORIAS = {
-    "CV": ("CV", ["EXPERIENCIA LABORAL", "REFERENCIAS LABORALES", "PERFIL PROFESIONAL", "CURRICULUM"], True),
+    "CV": ("CV", ["EXPERIENCIA LABORAL", "REFERENCIAS LABORALES", "PERFIL PROFESIONAL", "CURRICULUM", "HABILIDADES", "FORMACION ACADEMICA", "ACERCA DE MI"], True),
     "ACTA_NACIMIENTO": ("Acta de nacimiento", ["ACTA DE NACIMIENTO", "REGISTRO CIVIL", "OFICIALIA", "NACIMIENTOS"], True),
     "INE": ("INE", ["INSTITUTO NACIONAL ELECTORAL", "CREDENCIAL PARA VOTAR", "CLAVE DE ELECTOR"], True),
     "COMPROBANTE_DOMICILIO": ("Comprobante de domicilio", ["COMISION FEDERAL DE ELECTRICIDAD", "CFE", "TELMEX", "RECIBO", "TOTAL A PAGAR", "PERIODO FACTURADO", "IZZI", "TELEFONOS DE MEXICO", "AGUA"], True),
     "COMPROBANTE_ESTUDIOS": ("Certificado de estudios", ["CERTIFICADO DE ESTUDIOS", "CURSO Y ACREDITO", "UNIVERSIDAD", "LICENCIATURA", "CEDULA PROFESIONAL", "SECRETARIA DE EDUCACION", "BACHILLERATO", "PROMEDIO GENERAL"], True),
     "CURP": ("CURP", ["CLAVE UNICA DE REGISTRO DE POBLACION", "CURP CERTIFICADA", "CLAVE:"], True),
-    "CSF": ("CSF", ["CONSTANCIA DE SITUACION FISCAL", "CEDULA DE IDENTIFICACION FISCAL", "REGISTRO FEDERAL DE CONTRIBUYENTES"], True),
+    "CSF": ("CSF", ["CONSTANCIA DE SITUACION FISCAL", "CEDULA DE IDENTIFICACION FISCAL", "REGISTRO FEDERAL DE CONTRIBUYENTES", "ACUSE UNICO DE INSCRIPCION", "INSCRIPCION AL REGISTRO FEDERAL", "IDCIF"], True),
     "NSS": ("NSS", ["NUMERO DE SEGURIDAD SOCIAL", "INSTITUTO MEXICANO DEL SEGURO SOCIAL", "IMSS"], True),
     "CUENTA_BANCARIA": ("Cuenta bancaria", ["CLABE", "ESTADO DE CUENTA", "NO. DE CUENTA", "CARATULA"], True),
     "INFONAVIT": ("Aviso de retención Infonavit", ["INFONAVIT", "INSTITUTO DEL FONDO NACIONAL DE LA VIVIENDA", "AVISO PARA RETENCION DE DESCUENTOS"], False),
@@ -907,12 +907,23 @@ CHECKLIST_OBLIGATORIO = [
 CONDICIONALES = {"INFONAVIT", "FONACOT", "CERTIFICADO_MEDICO", "CERTIFICADO_INSTRUCTOR", "CONSTANCIA_LABORAL"}
 
 
+def _palabra_clave_presente(palabra, texto_norm):
+    """Busca una palabra clave en el texto normalizado. Las claves cortas
+    (CFE, AGUA, IMSS...) exigen límites de palabra para no activarse dentro
+    de otras palabras (p. ej. AGUA dentro de "AGUASCALIENTES"); las frases
+    largas se buscan como subcadena, tolerando variantes pegadas."""
+    clave = normaliza(palabra)
+    if len(clave) <= 5 and clave.replace(" ", "").isalnum():
+        return re.search(r"(?<![A-Z0-9])" + re.escape(clave) + r"(?![A-Z0-9])", texto_norm) is not None
+    return clave in texto_norm
+
+
 def clasificar(texto_completo, nombre_archivo):
     t = normaliza(texto_completo)
     nombre_arch_norm = normaliza(nombre_archivo)
     mejor_clave, mejor_score = "DESCONOCIDO", 0
     for clave, (_, palabras, _) in CATEGORIAS.items():
-        score = sum(1 for p in palabras if normaliza(p) in t)
+        score = sum(1 for p in palabras if _palabra_clave_presente(p, t))
         # pequeño empujón si el nombre del archivo ya lo sugiere
         pistas_nombre = {
             "CV": ["CV", "CURRICULUM"], "ACTA_NACIMIENTO": ["ACTA"], "INE": ["INE", "IFE"],
@@ -1189,7 +1200,8 @@ _CSF_ETQ_NUMERO_INTERIOR = r"NUMERO\s*INTERIOR"
 _CSF_ETQ_COLONIA = r"NOMBRE\s*DE\s*LA\s*COLONIA"
 _CSF_ETQ_LOCALIDAD = r"NOMBRE\s*DE\s*LA\s*LOCALIDAD"
 _CSF_ETQ_MUNICIPIO = r"NOMBRE\s*DEL\s*MUNICIPIO\s*O\s*DEMARCACION\s*TERRITORIAL"
-_CSF_ETQ_ENTIDAD = r"NOMBRE\s*DE\s*LA\s*ENTIDAD\s*FEDERATIVA"
+# la palabra FEDERATIVA a veces sale deformada del OCR ("ENTIDAD EEN:")
+_CSF_ETQ_ENTIDAD = r"NOMBRE\s*DE\s*LA\s*ENTIDAD(?:\s*FEDERATIVA|\s*[A-Z]{1,12}(?=\s*:))?"
 _CSF_ETQ_ENTRE_CALLE = r"ENTRE\s*CALLE"
 _CSF_ETQ_Y_CALLE = r"Y\s*CALLE"
 _CSF_ETQ_FIN_SECCION = r"ACTIVIDADES\s*ECONOMICAS|REGIMENES"
@@ -1307,9 +1319,29 @@ def extraer_regimen_csf(texto_completo):
 # etiqueta ("Nombre (s):", "Primer Apellido:", "Segundo Apellido:"). Se
 # ancla cada campo a la etiqueta que le sigue, en vez de a un largo fijo,
 # porque el nombre y los apellidos pueden traer más de una palabra.
-PATRON_NOMBRES_CSF = re.compile(r"NOMBRE\s*\(S\)\s*:?\s*(.+?)\s*PRIMER\s*APELLIDO\s*:")
-PATRON_APELLIDO_PATERNO_CSF = re.compile(r"PRIMER\s*APELLIDO\s*:?\s*(.+?)\s*SEGUNDO\s*APELLIDO\s*:")
-PATRON_APELLIDO_MATERNO_CSF = re.compile(r"SEGUNDO\s*APELLIDO\s*:?\s*(.+?)\s*FECHA\s*INICIO\s*DE\s*OPERACIONES\s*:")
+_SEP_CSF = r"[\s:|!\[\]\.\-_]*"
+PATRON_NOMBRES_CSF = re.compile(r"NOMBRE\s*\(S\)" + _SEP_CSF + r"(.{1,80}?)\s*PRIMER\s*APELLIDO")
+PATRON_APELLIDO_PATERNO_CSF = re.compile(r"PRIMER\s*APELLIDO" + _SEP_CSF + r"(.{1,60}?)\s*SEGUNDO\s*APELLIDO")
+PATRON_APELLIDO_MATERNO_CSF = re.compile(
+    r"SEGUNDO\s*APELLIDO" + _SEP_CSF + r"(.{0,60}?)\s*(?:FECHA\s*INICIO\s*DE\s*OPERACIONES|NOMBRE\s*COMERCIAL|ESTATUS|FECHA\s*DE\s*ULTIMO)"
+)
+
+
+def _limpia_nombre_csf(valor):
+    """Deja solo letras y espacios de un nombre/apellido capturado: el texto
+    de la CSF o del acuse del RFC puede traer ahí separadores de tabla leídos
+    como '|', '1' o ':' (los nombres no llevan dígitos ni símbolos). Si lo que
+    queda es demasiado largo para ser un nombre, regresa None."""
+    if not valor:
+        return None
+    limpio = re.sub(r"[^A-Z ]+", " ", valor.upper())
+    limpio = re.sub(r"\s+", " ", limpio).strip()
+    # una letra suelta al final (o una I/L al inicio) es un separador mal leído
+    limpio = re.sub(r"(?:\s+[A-Z])+$", "", limpio)
+    limpio = re.sub(r"^(?:[IL]\s+)+", "", limpio)
+    if not limpio or len(limpio) > 50:
+        return None
+    return limpio
 
 
 def extraer_nombres_csf(texto_completo):
@@ -1317,7 +1349,7 @@ def extraer_nombres_csf(texto_completo):
     "Nombre (s):" y la etiqueta "Primer Apellido:" que le sigue. Regresa el
     texto detectado o None si no se encontró."""
     m = PATRON_NOMBRES_CSF.search(normaliza(texto_completo))
-    return (m.group(1).strip() or None) if m else None
+    return _limpia_nombre_csf(m.group(1)) if m else None
 
 
 def extraer_apellido_paterno_csf(texto_completo):
@@ -1325,17 +1357,18 @@ def extraer_apellido_paterno_csf(texto_completo):
     etiquetas "Primer Apellido:" y "Segundo Apellido:". Regresa el texto
     detectado o None si no se encontró."""
     m = PATRON_APELLIDO_PATERNO_CSF.search(normaliza(texto_completo))
-    return (m.group(1).strip() or None) if m else None
+    return _limpia_nombre_csf(m.group(1)) if m else None
 
 
 def extraer_apellido_materno_csf(texto_completo):
     """Extrae el Segundo Apellido impreso en la CSF, anclado entre la
-    etiqueta "Segundo Apellido:" y la etiqueta "Fecha inicio de
-    operaciones:" que le sigue en la plantilla del SAT. Regresa el texto
-    detectado o None si no se encontró (por ejemplo, si el contribuyente
-    solo tiene un apellido, ese renglón viene vacío en la CSF)."""
+    etiqueta "Segundo Apellido:" y la etiqueta que le sigue en la plantilla
+    del SAT ("Fecha inicio de operaciones:" en la CSF; "Nombre Comercial:" en
+    el acuse de inscripción). Regresa el texto detectado o None si no se
+    encontró (por ejemplo, si el contribuyente solo tiene un apellido, ese
+    renglón viene vacío)."""
     m = PATRON_APELLIDO_MATERNO_CSF.search(normaliza(texto_completo))
-    return (m.group(1).strip() or None) if m else None
+    return _limpia_nombre_csf(m.group(1)) if m else None
 
 
 # El renglón "Nombre(s): ..." de arriba a veces pierde el espacio ENTRE
@@ -1360,7 +1393,14 @@ def extraer_nombre_completo_csf_encabezado(texto_completo):
     renglón "Nombre(s):" de más abajo). Regresa el texto detectado o None
     si no se encontró ese encabezado."""
     m = PATRON_NOMBRE_COMPLETO_CSF_ENCABEZADO.search(normaliza(texto_completo))
-    return (m.group(1).strip() or None) if m else None
+    if not m:
+        return None
+    valor = m.group(1).strip()
+    # un nombre real son pocas palabras sin símbolos; si el patrón abarcó
+    # texto de otras secciones (OCR/capa de texto basura), se descarta
+    if not valor or len(valor) > 60 or re.search(r"[^A-Z ]", valor):
+        return None
+    return valor
 
 
 def extraer_nombres_csf_bien_espaciado(texto_completo, apellido_paterno, apellido_materno):
@@ -1592,6 +1632,29 @@ def _campos_clave_comprobante(texto):
     return int(fecha is not None) + int(bool(direccion)), 2
 
 
+def _campos_clave_cuenta(texto):
+    """(campos_ok, total) para el documento bancario: basta una CLABE
+    válida o un número de cuenta explícito (el banco se deduce de la CLABE)."""
+    r = analiza_cuenta_bancaria(texto, "")
+    ok = bool(r["clabe_detectada"] and _clabe_valida(r["clabe_detectada"])) or bool(r["numero_cuenta"])
+    return int(ok), 1
+
+
+def _campos_clave_csf(texto):
+    """(campos_ok, total) para la hoja 1 de la CSF / acuse del RFC: el
+    domicilio fiscal armado sin símbolos de ruido (con calle, municipio y
+    entidad) y el código postal. En una CSF bajada del SAT siempre salen
+    completos, así que el OCR reforzado casi nunca se activa."""
+    d = extraer_domicilio_csf(texto)
+    dir_ok = bool(
+        d["direccion_fiscal"] and d["nombre_vialidad"] and d["municipio"] and d["entidad_federativa"]
+        and not re.search(r"[~_|\\<>\[\]{}]", d["direccion_fiscal"])
+        and not re.search(r"[:]", d["entidad_federativa"])
+        and len(d["entidad_federativa"]) <= 30
+    )
+    return int(dir_ok) + int(bool(d["codigo_postal"])), 2
+
+
 _ETIQUETAS_DOMICILIO_COMPROBANTE = [
     "DOMICILIO DEL SERVICIO", "DOMICILIO DEL USUARIO", "NOMBRE Y DOMICILIO DEL USUARIO",
     "DIRECCION DEL SERVICIO", "DOMICILIO DE INSTALACION", "DOMICILIO",
@@ -1600,6 +1663,8 @@ _ETIQUETAS_DOMICILIO_COMPROBANTE = [
 _CAMPOS_CLAVE_POR_CATEGORIA = {
     "INE": _campos_clave_ine,
     "COMPROBANTE_DOMICILIO": _campos_clave_comprobante,
+    "CUENTA_BANCARIA": _campos_clave_cuenta,
+    "CSF": _campos_clave_csf,
 }
 
 
@@ -1635,12 +1700,17 @@ def _refuerza_ocr_si_hace_falta(ruta, clave, paginas_texto, ocr_usado):
         return paginas_texto, ocr_usado, False
     paginas, ocr, aplicado = list(paginas_texto), list(ocr_usado), False
     # INE: solo la cara frontal (página 1); comprobante: hasta 2 páginas.
-    limite = 1 if clave == "INE" else min(len(paginas), 2)
+    limite = 1 if clave in ("INE", "CSF") else min(len(paginas), 2)
     for i in range(limite):
         original = paginas[i]
         candidatos = _ocr_reforzado_candidatos(ruta, i, campos_ok=lambda t, o=original: chequeo(t + "\n" + o))
         if clave == "INE":
             alt = _mejores_lecturas_ine(candidatos)
+        elif clave == "CSF" and candidatos:
+            mejor = max(candidatos, key=lambda c: (chequeo(c + "\n" + original)[0], _calidad_texto(c)))
+            # la mejor lectura va primero (manda en el domicilio); las demás
+            # franjas aportan el resto de los campos (nombre, apellidos)
+            alt = "\n".join([mejor] + [c for c in candidatos if c is not mejor])
         else:
             alt = "\n".join(candidatos)
         if alt:
@@ -1853,14 +1923,31 @@ BANCOS_EXCLUIDOS = {"NVIO Pagos México (Nu)", "Mercado Pago W Digital", "Spin b
 NOMBRES_EXCLUIDOS_TEXTO = ["NU MEXICO", "NU BANK", "SPIN BY OXXO", "MERCADO PAGO", "MERCADOPAGO"]
 
 
+def _clabe_valida(clabe):
+    """Valida los 18 dígitos y el dígito verificador de una CLABE."""
+    if not clabe or len(clabe) != 18 or not clabe.isdigit():
+        return False
+    pesos = [3, 7, 1] * 6
+    suma = sum((int(d) * pesos[i]) % 10 for i, d in enumerate(clabe[:17]))
+    return (10 - suma % 10) % 10 == int(clabe[17])
+
+
 def analiza_cuenta_bancaria(texto_completo, nombre_candidato):
     obs = []
     t_norm = normaliza(texto_completo)
 
-    m_clabe = re.search(r"CLABE[^0-9]{0,15}(\d[\d\s]{16,22}\d)", t_norm)
+    # la etiqueta puede venir mal leída por el OCR (CLASE, CLABF, CLAVE...)
+    m_clabe = re.search(r"CLA[BV8S][EF3]\b[^0-9]{0,15}(\d[\d\s]{16,22}\d)", t_norm)
     clabe = re.sub(r"\s", "", m_clabe.group(1)) if m_clabe else None
     if clabe and len(clabe) >= 18:
         clabe = clabe[:18]
+    if not clabe or not _clabe_valida(clabe):
+        # respaldo: cualquier número de 18 dígitos con dígito verificador
+        # válido y código de banco conocido (no depende de la etiqueta)
+        for m in re.finditer(r"(?<!\d)(\d{18})(?!\d)", t_norm):
+            if _clabe_valida(m.group(1)) and m.group(1)[:3] in CODIGOS_CLABE_BANCOS:
+                clabe = m.group(1)
+                break
 
     banco = None
     if clabe:
@@ -1868,6 +1955,11 @@ def analiza_cuenta_bancaria(texto_completo, nombre_candidato):
 
     m_cuenta = re.search(r"(?:NO\.?\s*DE\s*CUENTA|NUMERO\s*DE\s*CUENTA|CUENTA)\s*:?\s*(\d{6,20})", t_norm)
     numero_cuenta = m_cuenta.group(1) if m_cuenta else None
+    cuenta_derivada = False
+    if numero_cuenta is None and clabe and _clabe_valida(clabe):
+        # en una CLABE, los dígitos 7 a 17 son el número de cuenta (11 dígitos)
+        numero_cuenta = clabe[6:17]
+        cuenta_derivada = True
     tiene_cuenta = numero_cuenta is not None
     nombre_ok, proporcion = nombre_coincide(texto_completo, nombre_candidato)
 
@@ -1890,7 +1982,9 @@ def analiza_cuenta_bancaria(texto_completo, nombre_candidato):
 
     if not clabe:
         obs.append("No se encontró una CLABE de 18 dígitos legible.")
-    if not tiene_cuenta:
+    if cuenta_derivada:
+        obs.append(f"Número de cuenta tomado de la CLABE (dígitos 7 a 17): {numero_cuenta}.")
+    elif not tiene_cuenta:
         obs.append("No se encontró un número de cuenta explícito.")
     obs.append("El logo del banco no puede confirmarse por OCR: revisar visualmente el PDF.")
 
@@ -1950,6 +2044,14 @@ def analiza_csf(paginas_texto):
     texto_completo = "\n".join(paginas_texto)
     t_norm = normaliza(texto_completo)
     obs = []
+    # El "Acuse único de inscripción al RFC" es una sola hoja, sin régimen
+    # ni estatus: no es la CSF completa pero se acepta como comprobante del RFC.
+    es_acuse = re.search(r"ACUSE\s*UNICO\W*DE\s*INSCRIPCION", t_norm) is not None
+    if es_acuse:
+        obs.append(
+            "El documento es el Acuse único de inscripción al RFC (una sola hoja; no trae régimen ni estatus en el "
+            "padrón), no la Constancia de Situación Fiscal completa."
+        )
 
     rfc = extraer_rfc(texto_completo)
     if rfc:
@@ -1981,7 +2083,7 @@ def analiza_csf(paginas_texto):
     regimen = extraer_regimen_csf(texto_completo)
     if regimen:
         obs.append(f"Régimen detectado (hoja 2): {regimen}.")
-    else:
+    elif not es_acuse:
         obs.append("No se detectó la tabla de 'Regímenes' (hoja 2) con el formato esperado; revisar manualmente.")
 
     apellido_paterno = extraer_apellido_paterno_csf(texto_completo)
@@ -2006,7 +2108,7 @@ def analiza_csf(paginas_texto):
         obs.append("La CSF indica estatus ACTIVO en el padrón del SAT.")
     elif estatus:
         obs.append(f"La CSF indica estatus '{estatus}' (revisar, no es ACTIVO).")
-    else:
+    elif not es_acuse:
         obs.append("No se pudo leer el estatus del contribuyente en el texto; revisar manualmente.")
 
     # Se prioriza la fecha junto a "Lugar y Fecha de Emisión" (ver docstring
@@ -2055,7 +2157,7 @@ def analiza_csf(paginas_texto):
         "apellido_materno": apellido_materno,
         "fecha_emision": emision_fecha,
         "dentro_3_meses": dentro_3_meses,
-        "num_paginas_ok": len(paginas_texto) >= 2,
+        "num_paginas_ok": len(paginas_texto) >= 2 or es_acuse,
         "observaciones": " ".join(obs),
     }
 
