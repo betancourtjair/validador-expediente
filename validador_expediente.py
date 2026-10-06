@@ -83,6 +83,7 @@ import io
 import os
 import re
 import sys
+import time
 import unicodedata
 import zipfile
 
@@ -200,17 +201,32 @@ def busca_fechas(texto):
             except ValueError:
                 pass
 
-    # formato abreviado tipo recibo (ej. CFE): "03 MAY 26" o "03/MAY/26"
-    patron_abrev = re.compile(r"(\d{1,2})\s*[/\s]\s*([A-Z]{3})\s*[/\s]\s*(\d{2})\b")
+    # formato abreviado tipo recibo (ej. CFE): "03 MAY 26", "03/MAY/26" y, como
+    # lo imprimen algunos recibos (Naturgy/CFE) y lo lee el OCR, sin
+    # separadores ("25Ago26") o con un cero de más en el año ("25Ago026").
+    patron_abrev = re.compile(r"(\d{1,2})\s*[/\s\-\.]?\s*([A-Z]{3})\s*[/\s\-\.]?\s*(\d{4}|0?\d{2})\b")
     for m in patron_abrev.finditer(normaliza(t)):
-        dia, mes_txt, anio2 = m.group(1), m.group(2), m.group(3)
+        dia, mes_txt, anio_txt = m.group(1), m.group(2), m.group(3)
         mes = MESES_ABREV.get(mes_txt.upper())
         if mes:
-            anio = 2000 + int(anio2)
+            anio = int(anio_txt) if len(anio_txt) == 4 else 2000 + int(anio_txt[-2:])
             try:
                 fechas.append((datetime.date(anio, mes, int(dia)), m.group(0)))
             except ValueError:
                 pass
+
+    # ISO "2026-08-12" y la fecha de timbrado de una factura electrónica
+    # ("Fecha Timbrado 20260812 23:53:05" / "Fecha Timbrado: 2026-08-12").
+    for m in re.finditer(r"\b(20\d{2})-(\d{2})-(\d{2})\b", t):
+        try:
+            fechas.append((datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3))), m.group(0)))
+        except ValueError:
+            pass
+    for m in re.finditer(r"FECHA\s*(?:DE\s*)?(?:TIMBRADO|EMISION|EXPEDICION)\D{0,6}(20\d{2})(\d{2})(\d{2})\b", normaliza(t)):
+        try:
+            fechas.append((datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3))), m.group(0)))
+        except ValueError:
+            pass
 
     return fechas
 
@@ -240,7 +256,7 @@ def fecha_mas_reciente_razonable(fechas, no_futuras=True):
 OCR_TIMEOUT_SEGUNDOS = 12
 
 
-def _ocr_con_confianza(imagen, lang="spa", config=""):
+def _ocr_con_confianza(imagen, lang="spa", config="", timeout=None):
     """Corre OCR y regresa (texto, confianza_promedio_0_a_100).
 
     A diferencia de adivinar qué tan "limpio" se ve un texto contando tipos
@@ -253,7 +269,7 @@ def _ocr_con_confianza(imagen, lang="spa", config=""):
     configuraciones de Tesseract leyó mejor una misma imagen."""
     try:
         datos = pytesseract.image_to_data(
-            imagen, lang=lang, config=config, timeout=OCR_TIMEOUT_SEGUNDOS,
+            imagen, lang=lang, config=config, timeout=timeout or OCR_TIMEOUT_SEGUNDOS,
             output_type=pytesseract.Output.DICT,
         )
     except Exception:
@@ -409,6 +425,231 @@ def _ocr_imagenes_incrustadas(ruta, indice_pagina, lang="spa", config="--psm 3")
     return texto_completo, confianza_prom
 
 
+# ---------------------------------------------------------------------------
+# OCR reforzado: SOLO se usa cuando la primera lectura no deja legibles los
+# datos clave (ver extraer_texto_pdf y procesar_documento). Nace de casos
+# reales de escáneres de celular (Adobe Scan y similares): el PDF trae una
+# imagen de página completa + una capa de texto "invisible" que el propio
+# escáner generó, casi siempre de muy mala calidad (la credencial es chica
+# dentro de una hoja blanca; el recibo viene con barras de color y QR). La
+# app confiaba en esa capa por traer "suficiente texto" y nunca corría su
+# OCR; y cuando sí corría, lo hacía sobre la página completa reducida, donde
+# el texto de una credencial queda demasiado chico para Tesseract.
+# ---------------------------------------------------------------------------
+
+# Cada llamada a Tesseract en el pase reforzado puede ser más lenta que en el
+# rápido (imágenes más grandes), así que tiene su propio límite; y hay un
+# tope total por página para que un documento imposible no trabe el Excel.
+OCR_TIMEOUT_REFORZADO_SEGUNDOS = 40
+OCR_PRESUPUESTO_REFORZADO_SEGUNDOS = 120
+# Por debajo de esta calificación (ver _calidad_texto) el texto nativo de un
+# escaneo se considera basura y se vuelve a leer con el OCR reforzado.
+CALIDAD_MINIMA_TEXTO_NATIVO = 0.25
+
+_VOCALES = set("AEIOUÁÉÍÓÚÜaeiouáéíóúü")
+
+
+def _calidad_texto(texto):
+    """Calificación 0-1 de qué tan "texto de verdad" es una cadena: proporción
+    de palabras reconocibles (letras, con vocales, sin rachas de consonantes
+    raras) y de números/códigos, penalizando renglones de 1-2 caracteres y
+    símbolos sueltos (~ • \\ < > ^ ...), que es lo que escupe un OCR malo.
+    No sabe de idioma ni de diccionarios: solo distingue basura obvia de
+    texto aprovechable (un documento digital normal sale >0.5; la capa de
+    texto de un escáner de celular fallido sale ~0)."""
+    toks = re.findall(r"\S+", texto or "")
+    if not toks:
+        return 0.0
+    puntos = 0.0
+    for t in toks:
+        s = t.strip(".,:;()\"'“”-/¿?¡!*•")
+        if (len(s) >= 3 and re.fullmatch(r"[^\W\d_]+", s) and any(c in _VOCALES for c in s)
+                and not re.search(r"[^\WAEIOUÁÉÍÓÚÜaeiouáéíóúü\d_]{5,}", s)):
+            puntos += 1.0
+        elif len(s) >= 2 and re.fullmatch(r"[\dA-Za-z/.,:\-$%]+", s) and re.search(r"\d", s):
+            puntos += 0.6
+        elif re.fullmatch(r"[^\W\d_]{2}", s):
+            puntos += 0.4  # conectores cortos: DE, LA, EL, EN, AL, UN
+    base = puntos / len(toks)
+    lineas = [l.strip() for l in texto.splitlines() if l.strip()]
+    cortas = sum(1 for l in lineas if len(l) <= 2) / max(1, len(lineas))
+    simbolos = sum(texto.count(c) for c in "~•\\|<>^_{}[]¬°") / max(1, len(re.sub(r"\s", "", texto)))
+    return max(0.0, base - 0.5 * cortas - 3 * simbolos)
+
+
+def _pagina_parece_escaneo(pagina):
+    """True si alguna imagen incrustada cubre la mayor parte de la página
+    (foto/escaneo), o sea, si el texto que trae el PDF no es "nativo" sino
+    el que le pegó el escáner encima."""
+    area_pagina = float(pagina.width * pagina.height) or 1.0
+    for im in pagina.images:
+        try:
+            if (im["x1"] - im["x0"]) * (im["bottom"] - im["top"]) >= 0.6 * area_pagina:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _tramos(ocupado, hueco_min):
+    """Rangos (ini, fin) de posiciones consecutivas ocupadas, uniendo los que
+    estén separados por menos de hueco_min posiciones vacías."""
+    tramos, ini, ult = [], None, None
+    for i, v in enumerate(ocupado):
+        if not v:
+            continue
+        if ini is None:
+            ini = i
+        elif i - ult - 1 >= hueco_min:
+            tramos.append((ini, ult))
+            ini = i
+        ult = i
+    if ini is not None:
+        tramos.append((ini, ult))
+    return tramos
+
+
+def _bloques_contenido(imagen, min_fraccion=0.03):
+    """Separa una hoja escaneada con contenido disperso -p.ej. anverso y
+    reverso de una credencial sobre una hoja casi blanca- en recortes, uno
+    por bloque, para poder leer cada uno AMPLIADO. Si no se distingue más de
+    un bloque (documento que ocupa toda la hoja, foto con fondo no blanco...)
+    regresa la imagen completa. Solo usa PIL (sin numpy/OpenCV)."""
+    w, h = imagen.size
+    gris = ImageOps.grayscale(imagen)
+    f = max(1, max(w, h) // 500)
+    peq = gris.resize((max(1, w // f), max(1, h // f)), Image.BOX)
+    pw, ph = peq.size
+    hist = peq.histogram()
+    total, acum, papel = pw * ph, 0, 255
+    for v in range(255, -1, -1):
+        acum += hist[v]
+        if acum >= total * 0.20:
+            papel = v
+            break
+    umbral = papel - 35
+    mascara = peq.point(lambda x: 255 if x < umbral else 0)
+    mascara = mascara.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.MaxFilter(5))
+
+    filas = list(mascara.resize((1, ph), Image.BOX).getdata())
+    bandas = _tramos([v > 255 * 0.015 for v in filas], max(2, int(ph * 0.03)))
+    bloques = []
+    for y0, y1 in bandas:
+        if (y1 - y0 + 1) < ph * 0.06:
+            continue
+        franja = mascara.crop((0, y0, pw, y1 + 1))
+        cols = list(franja.resize((pw, 1), Image.BOX).getdata())
+        ocupadas = [i for i, v in enumerate(cols) if v > 255 * 0.015]
+        if not ocupadas:
+            continue
+        x0, x1 = ocupadas[0], ocupadas[-1]
+        if (x1 - x0 + 1) * (y1 - y0 + 1) < pw * ph * min_fraccion:
+            continue
+        mx, my = int(pw * 0.015), int(ph * 0.015)
+        caja = (max(0, x0 - mx) * f, max(0, y0 - my) * f, min(pw, x1 + 1 + mx) * f, min(ph, y1 + 1 + my) * f)
+        bloques.append(imagen.crop((caja[0], caja[1], min(w, caja[2]), min(h, caja[3]))))
+    if not bloques:
+        return [imagen]
+    if len(bloques) == 1 and bloques[0].width * bloques[0].height >= 0.8 * w * h:
+        return [imagen]
+    return bloques
+
+
+def _escala_a_ancho(imagen, ancho):
+    if imagen.width == ancho:
+        return imagen
+    return imagen.resize((ancho, max(1, round(imagen.height * ancho / imagen.width))), Image.LANCZOS)
+
+
+def _binariza_local(gris, factor):
+    """Binariza con el umbral calculado con el brillo de ESA imagen (no de la
+    página completa): sobre fondos de color/guilloché separa mejor el texto."""
+    gris = ImageOps.autocontrast(gris, cutoff=0)
+    brillo = ImageStat.Stat(gris).mean[0]
+    return gris.point(lambda x, u=brillo * factor: 255 if x > u else 0).filter(ImageFilter.SHARPEN)
+
+
+def _pasos_ocr_reforzado(bloque, limitado=False):
+    """Lista de (imagen_preparada, psm) a probar, de la más prometedora a la
+    menos. Para un bloque con forma de credencial (relación ~1.6) se lee la
+    columna de texto -sin la foto ni la marca de agua- a ~3x, que es donde
+    mejor sale el domicilio y la vigencia, y la tarjeta completa a ~1800 px.
+    Para un documento de hoja completa se lee por franjas a resolución casi
+    nativa (reducir toda la hoja a la vez deja el texto chico y, además,
+    Tesseract tarda tanto que se pasa del límite de tiempo)."""
+    ancho, alto = bloque.size
+    pasos = []
+    if 1.3 <= ancho / max(1, alto) <= 1.85 and ancho <= 2600:
+        col = _escala_a_ancho(bloque.crop((int(ancho * .33), int(alto * .16), int(ancho * .80), int(alto * .97))), 1200)
+        completa = _escala_a_ancho(bloque, 1800)
+        g_col, g_comp = ImageOps.grayscale(col), ImageOps.grayscale(completa)
+        a_col = ImageOps.autocontrast(g_col, cutoff=0)
+        a_comp = ImageOps.autocontrast(g_comp, cutoff=0)
+        pasos = [(a_col, "6"), (_binariza_local(g_col, 0.7), "6"), (a_comp, "6"),
+                 (_binariza_local(g_col, 0.8), "4"), (a_col, "3"), (a_comp, "3")]
+        return pasos[:3] if limitado else pasos
+    g = ImageOps.autocontrast(ImageOps.grayscale(_escala_a_ancho(bloque, min(2000, max(1600, ancho)))), cutoff=0)
+    w, h = g.size
+    franjas = [(0, h)] if h <= w * 0.8 else [(int(h * a), int(h * b)) for a, b in ((0, .36), (.30, .66), (.62, 1.0))]
+    for psm in (("3",) if limitado else ("3", "6")):
+        for y0, y1 in franjas:
+            pasos.append((g.crop((0, y0, w, y1)), psm))
+    return pasos
+
+
+def _ocr_reforzado(ruta, indice_pagina, campos_ok=None):
+    """Igual que _ocr_reforzado_candidatos pero con todo el texto unido en una
+    sola cadena (lo que necesita el pase automático de extraer_texto_pdf)."""
+    return "\n".join(_ocr_reforzado_candidatos(ruta, indice_pagina, campos_ok))
+
+
+def _ocr_reforzado_candidatos(ruta, indice_pagina, campos_ok=None):
+    """Lectura reforzada de UNA página: recorta/amplía la imagen incrustada y
+    prueba varias variantes de OCR, deteniéndose en cuanto 'campos_ok'
+    (callable texto -> (cuantos_ok, total)) dice que ya salieron todos los
+    campos clave; si no hay campos_ok (no se sabe qué buscar) solo corre las
+    primeras variantes. Regresa la LISTA de textos de las variantes que se
+    corrieron (la de mejor calidad primero; [] si no se pudo leer nada): así
+    quien la usa puede quedarse con la mejor lectura de CADA campo en vez de
+    mezclarlas todas."""
+    inicio = time.monotonic()
+    imagenes = _extraer_imagenes_incrustadas(ruta, indice_pagina)
+    if not imagenes:
+        try:
+            pag = convert_from_path(ruta, dpi=300, first_page=indice_pagina + 1, last_page=indice_pagina + 1)
+            imagenes = [pag[0].convert("RGB")] if pag else []
+        except Exception:
+            imagenes = []
+    candidatos = []
+
+    def completo():
+        if campos_ok is None:
+            return False
+        ok, total = campos_ok("\n".join(candidatos))
+        return ok >= total
+
+    for imagen in imagenes:
+        for bloque in _bloques_contenido(imagen):
+            for preparada, psm in _pasos_ocr_reforzado(bloque, limitado=campos_ok is None):
+                if time.monotonic() - inicio > OCR_PRESUPUESTO_REFORZADO_SEGUNDOS:
+                    break
+                try:
+                    texto, _ = _ocr_con_confianza(preparada, lang="spa", config=f"--psm {psm}",
+                                                  timeout=OCR_TIMEOUT_REFORZADO_SEGUNDOS)
+                except Exception:
+                    texto = ""
+                if texto and len(texto.strip()) >= 10:
+                    candidatos.append(texto)
+                if completo():
+                    break
+            if completo():
+                break
+        if completo():
+            break
+    candidatos.sort(key=_calidad_texto, reverse=True)
+    return candidatos
+
+
 def extraer_texto_pdf(ruta):
     """Regresa (lista_de_texto_por_pagina, num_paginas, uso_ocr_por_pagina).
 
@@ -434,12 +675,28 @@ def extraer_texto_pdf(ruta):
     """
     paginas_texto = []
     ocr_usado = []
+    es_escaneo = []
     with pdfplumber.open(ruta) as pdf:
         num_paginas = len(pdf.pages)
         for pagina in pdf.pages:
             texto = (pagina.extract_text() or "").strip()
             paginas_texto.append(texto)
             ocr_usado.append(False)
+            es_escaneo.append(_pagina_parece_escaneo(pagina))
+
+    # Escáneres de celular (Adobe Scan y similares) pegan sobre la imagen una
+    # capa de texto propia que, si la foto no salió perfecta, es casi pura
+    # basura ("BECERR.\\.", "CUALHTEMOC, COMX"). Traer "suficientes
+    # caracteres" no significa que sea legible: si la página es un escaneo y
+    # ese texto califica muy mal, se lee de nuevo con el OCR reforzado y se
+    # reemplaza SOLO si lo nuevo califica claramente mejor. Un PDF digital
+    # normal (sin imagen de página completa) nunca entra aquí.
+    for i, t in enumerate(paginas_texto):
+        if len(t) >= 20 and es_escaneo[i] and _calidad_texto(t) < CALIDAD_MINIMA_TEXTO_NATIVO:
+            alt = _ocr_reforzado(ruta, i)
+            if alt and _calidad_texto(alt) > _calidad_texto(t) + 0.10:
+                paginas_texto[i] = alt
+                ocr_usado[i] = True
 
     # Umbral de confianza (0-100, escala propia de Tesseract) bajo el cual se
     # considera que un pase de OCR "no se puede confiar" y conviene escalar
@@ -814,8 +1071,14 @@ def extraer_nss(texto_completo):
     """Extrae el Número de Seguridad Social del documento de "Asignación de
     NSS" del IMSS, anclado a la etiqueta "Número de Seguridad Social".
     Regresa el NSS detectado (11 dígitos) o None si no se encontró."""
-    m = PATRON_NSS.search(normaliza(texto_completo))
-    return m.group(1) if m else None
+    t_norm = normaliza(texto_completo)
+    m = PATRON_NSS.search(t_norm)
+    if m:
+        return m.group(1)
+    # Formatos tipo "NSS: 0421069193 -9" (aviso/solicitud del IMSS que imprime
+    # el dígito verificador separado por un guion).
+    m = re.search(r"\bNSS\s*:?\s*(\d{10})\s*[-–]?\s*(\d)\b", t_norm)
+    return m.group(1) + m.group(2) if m else None
 
 
 # Códigos de entidad federativa que usa el CURP (posiciones 12-13), definidos
@@ -1191,6 +1454,7 @@ _DIRECCION_ETIQUETAS_CORTE = [
     "SUBTOTAL", "MEDIDOR", "CONSUMO", "REFERENCIA", "RFC", "FECHA DE NACIMIENTO",
     "SEXO", "CLAVE DE LA ELECTORA", "INSTITUTO NACIONAL ELECTORAL", "CREDENCIAL PARA VOTAR",
     "AVISO DE PRIVACIDAD", "ANO DE REGISTRO", "EMISION", "MUNICIPIO EMISOR",
+    "ELECTOR",  # "CLAVE DE ELECTOR" mal leída por el OCR ("CUVEDE ELECTOR")
 ]
 
 
@@ -1221,8 +1485,11 @@ def extraer_direccion(texto_completo, etiquetas, ventana=220, max_lineas=4):
 
         recolectadas = []
         for linea_orig, linea_plano in zip(lineas_orig, lineas_plano):
-            linea_orig_limpia = re.sub(r"\s+", " ", linea_orig).strip(" :.-\t")
-            linea_plano_limpia = linea_plano.strip()
+            # Símbolos sueltos que mete el OCR (| \\ < > ~ _ * ^ ! ¡) no son parte de
+            # ninguna dirección; se quitan para que no ensucien el resultado ni
+            # hagan pasar por "texto" un renglón que solo trae una raya.
+            linea_orig_limpia = re.sub(r"\s+", " ", re.sub(r"[|\\<>~_*^!¡]+", " ", linea_orig)).strip(" :.-\t")
+            linea_plano_limpia = re.sub(r"[|\\<>~_*^!¡]+", " ", linea_plano).strip()
             if not linea_plano_limpia:
                 if recolectadas:
                     break
@@ -1240,6 +1507,151 @@ def extraer_direccion(texto_completo, etiquetas, ventana=220, max_lineas=4):
     return None
 
 
+def extraer_domicilio_etiquetado(texto):
+    """Recibos (Naturgy, CFE, agua...) que imprimen el domicilio como campos
+    con etiqueta en vez de un bloque "DOMICILIO":
+
+        Calle: RAMON FABIE  Núm: 0014
+        Colonia: VISTA ALEGRE  C.P.: 06860
+        Mpo/Edo: CUAUHTEMOC, CD. DE MEX.
+
+    Regresa la dirección en una línea ("calle núm, colonia, municipio, estado
+    C.P. 06860", el mismo formato que extraer_direccion, para que lo
+    descomponga descomponer_direccion) o None si no se encuentran, al menos,
+    la calle y la colonia o el municipio. Tolera que el OCR pegue palabras
+    ("RAMONFABIE") o suelte puntos/dos puntos."""
+    t = re.sub(r"[ \t]+", " ", texto or "")
+
+    def _uno(patron):
+        m = re.search(patron, t, flags=re.IGNORECASE)
+        return re.sub(r"\s+", " ", m.group(1)).strip(" :.-,") if m else None
+
+    calle = _uno(r"\bCalle\s*[:.]\s*(.+?)(?=\s+N[uú]m(?:ero)?\b|\n|$)")
+    numero = _uno(r"\bN[uú]m(?:ero)?\.?\s*[:.]\s*([A-Za-z0-9\-]+)")
+    colonia = _uno(r"\bColonia\s*[:.]\s*(.+?)(?=\s+C\.?\s*P\b|\n|$)")
+    cp = _uno(r"\bC\.?\s*P\.?\s*[:.]*\s*(\d{5})\b")
+    municipio = _uno(r"\b(?:Mpo|Municipio|Delegaci[oó]n|Alcald[ií]a)\s*(?:/\s*Edo\.?)?\s*[:.]\s*(.+?)(?=\n|$)")
+    if not calle or not (colonia or municipio):
+        return None
+    piezas = [" ".join(p for p in (calle, numero) if p), colonia, municipio]
+    direccion = ", ".join(p for p in piezas if p)
+    if cp:
+        direccion += f" C.P. {cp}"
+    return direccion
+
+
+def _normaliza_etiqueta_domicilio(texto):
+    """El OCR suele leer mal la etiqueta del domicilio del INE ("DOMICIIO",
+    "DOMICUIO", "DOMCILIO"...). Se corrige a "DOMICILIO" para que
+    extraer_direccion la encuentre."""
+    return re.sub(r"(?<![A-Za-z])DOM[ILU1]?C[ILU1]{1,3}O(?![A-Za-z])", "DOMICILIO", texto or "", flags=re.IGNORECASE)
+
+
+def _direccion_ine(texto):
+    return extraer_direccion(_normaliza_etiqueta_domicilio(texto), ["DOMICILIO"])
+
+
+def _puntaje_direccion(direccion):
+    """0-1: qué tan "dirección de verdad" se ve una dirección extraída (sin
+    símbolos de OCR, con estado reconocible, número de casa, municipio corto
+    y limpio, código postal). Sirve para elegir entre varias lecturas de OCR
+    de la misma credencial la que dejó el domicilio mejor leído."""
+    if not direccion:
+        return 0.0
+    dom = descomponer_direccion(direccion)
+    puntos = 0.0
+    if not re.search(r"[><|!~*{}\[\]¡¿^]", direccion):
+        puntos += 0.3
+    if dom.get("estado") and _es_estado_mexico(normaliza(dom["estado"])):
+        puntos += 0.25
+    muni = dom.get("municipio") or ""
+    if muni and len(muni.split()) <= 4 and re.fullmatch(r"[A-Za-zÁÉÍÓÚÑáéíóúñ .\-]+", muni):
+        puntos += 0.2
+    if dom.get("numero_exterior") or re.search(r"\d", dom.get("calle") or ""):
+        puntos += 0.15
+    if dom.get("codigo_postal"):
+        puntos += 0.1
+    return puntos
+
+
+def _campos_clave_ine(texto):
+    """(campos_ok, total) de lo que se necesita leer de la cara frontal del
+    INE para el reporte: domicilio (calle + municipio o estado) y vigencia
+    (dos años junto a VIGENCIA). Lo usa el pase de OCR reforzado para saber
+    si ya terminó."""
+    domicilio_ok = _puntaje_direccion(_direccion_ine(texto)) >= 0.7
+    vigencia_ok = _busca_vigencia_ine(normaliza(texto)) is not None
+    return int(domicilio_ok) + int(vigencia_ok), 2
+
+
+def _campos_clave_comprobante(texto):
+    """(campos_ok, total) para el comprobante de domicilio: una fecha que
+    permita calcular la vigencia y un domicilio."""
+    _, _, fecha = analiza_comprobante_domicilio(texto)
+    direccion = extraer_domicilio_etiquetado(texto) or extraer_direccion(texto, _ETIQUETAS_DOMICILIO_COMPROBANTE)
+    return int(fecha is not None) + int(bool(direccion)), 2
+
+
+_ETIQUETAS_DOMICILIO_COMPROBANTE = [
+    "DOMICILIO DEL SERVICIO", "DOMICILIO DEL USUARIO", "NOMBRE Y DOMICILIO DEL USUARIO",
+    "DIRECCION DEL SERVICIO", "DOMICILIO DE INSTALACION", "DOMICILIO",
+]
+
+_CAMPOS_CLAVE_POR_CATEGORIA = {
+    "INE": _campos_clave_ine,
+    "COMPROBANTE_DOMICILIO": _campos_clave_comprobante,
+}
+
+
+def _mejores_lecturas_ine(candidatos):
+    """De varias lecturas de OCR de la misma credencial, se queda con la que
+    dejó mejor el DOMICILIO y con la primera que trae la VIGENCIA (pueden ser
+    distintas: cada variante de OCR acierta en renglones diferentes), y las
+    une con la del domicilio primero. Las demás lecturas -casi siempre ruido
+    del reverso o de la marca de agua- se descartan."""
+    if not candidatos:
+        return ""
+    mejor_dom = max(candidatos, key=lambda c: (_puntaje_direccion(_direccion_ine(c)), _calidad_texto(c)))
+    elegidos = [mejor_dom]
+    if _busca_vigencia_ine(normaliza(mejor_dom)) is None:
+        for c in candidatos:
+            if c is not mejor_dom and _busca_vigencia_ine(normaliza(c)) is not None:
+                elegidos.append(c)
+                break
+    return "\n".join(elegidos)
+
+
+def _refuerza_ocr_si_hace_falta(ruta, clave, paginas_texto, ocr_usado):
+    """Si la categoría tiene campos clave (ver _CAMPOS_CLAVE_POR_CATEGORIA) y
+    el texto que ya se tiene NO los deja a todos legibles, corre el OCR
+    reforzado (ver _ocr_reforzado) y antepone su texto al de la página. Si la
+    primera lectura ya salió completa NO hace nada (cero costo extra).
+    Regresa (paginas_texto, ocr_usado, aplicado)."""
+    chequeo = _CAMPOS_CLAVE_POR_CATEGORIA.get(clave)
+    if chequeo is None:
+        return paginas_texto, ocr_usado, False
+    ok, total = chequeo("\n".join(paginas_texto))
+    if ok >= total:
+        return paginas_texto, ocr_usado, False
+    paginas, ocr, aplicado = list(paginas_texto), list(ocr_usado), False
+    # INE: solo la cara frontal (página 1); comprobante: hasta 2 páginas.
+    limite = 1 if clave == "INE" else min(len(paginas), 2)
+    for i in range(limite):
+        original = paginas[i]
+        candidatos = _ocr_reforzado_candidatos(ruta, i, campos_ok=lambda t, o=original: chequeo(t + "\n" + o))
+        if clave == "INE":
+            alt = _mejores_lecturas_ine(candidatos)
+        else:
+            alt = "\n".join(candidatos)
+        if alt:
+            paginas[i] = alt + "\n" + original
+            ocr[i] = True
+            aplicado = True
+        if chequeo("\n".join(paginas))[0] >= total:
+            break
+    return paginas, ocr, aplicado
+
+
 # Nombres/abreviaturas de los 32 estados de México, tal como suelen
 # aparecer impresos al final de una dirección (INE, comprobante de
 # domicilio). Se usan SOLO para reconocer cuál pedazo de la dirección es
@@ -1251,7 +1663,7 @@ ESTADOS_MEXICO_ALIAS = {
     "BAJA CALIFORNIA", "BC", "BCN",
     "BAJA CALIFORNIA SUR", "BCS",
     "CAMPECHE", "CAMP",
-    "CIUDAD DE MEXICO", "CDMX", "DISTRITO FEDERAL", "DF",
+    "CIUDAD DE MEXICO", "CDMX", "COMX", "CD DE MEXICO", "CD DE MEX", "CIUDAD DE MEX", "DISTRITO FEDERAL", "DF",
     "COAHUILA", "COAH", "COAHUILA DE ZARAGOZA",
     "COLIMA", "COL",
     "CHIAPAS", "CHIS",
@@ -1286,7 +1698,7 @@ def _es_estado_mexico(texto_normalizado):
     """True si 'texto_normalizado' (mayúsculas, sin acentos) es -tal cual o
     quitándole un punto final- uno de los nombres/abreviaturas de estado en
     ESTADOS_MEXICO_ALIAS."""
-    return texto_normalizado.rstrip(".").strip() in ESTADOS_MEXICO_ALIAS
+    return re.sub(r"\s+", " ", texto_normalizado.replace(".", " ")).strip() in ESTADOS_MEXICO_ALIAS
 
 
 def descomponer_direccion(direccion):
@@ -1694,6 +2106,19 @@ def _ocr_vigencia_ine(ruta):
     return None
 
 
+def _busca_vigencia_ine(texto_norm):
+    """(anio_inicio, anio_fin) de la primera aparición de "VIGENCIA" que
+    traiga dos años (19xx/20xx) en los 80 caracteres siguientes; None si no
+    hay ninguna. Se prueban TODAS las apariciones (no solo la primera): con
+    varias lecturas de OCR concatenadas, una puede traer la palabra sin los
+    años y otra con ellos."""
+    for m in re.finditer("VIGENCIA", texto_norm):
+        anios = re.findall(r"\b(19\d{2}|20\d{2})\b", texto_norm[m.start(): m.start() + 80])
+        if len(anios) >= 2:
+            return int(anios[-2]), int(anios[-1])
+    return None
+
+
 def analiza_ine(paginas_texto, ruta=None):
     obs = []
 
@@ -1715,13 +2140,7 @@ def analiza_ine(paginas_texto, ruta=None):
     # años (19xx/20xx) más cercanos después de la palabra VIGENCIA en vez de
     # exigir que estén pegados a ella.
     def _busca_vigencia(texto_norm):
-        idx = texto_norm.find("VIGENCIA")
-        if idx == -1:
-            return None
-        anios = re.findall(r"\b(19\d{2}|20\d{2})\b", texto_norm[idx: idx + 80])
-        if len(anios) < 2:
-            return None
-        return int(anios[-2]), int(anios[-1])
+        return _busca_vigencia_ine(texto_norm)
 
     encontrada = _busca_vigencia(t_norm)
     recuperada_con_reintento = False
@@ -1868,6 +2287,13 @@ def procesar_documento(ruta, nombre_candidato, categoria_forzada=None):
     clave = categoria_forzada or clasificar(texto_completo, nombre_archivo)
     nombre_legible, _, _ = CATEGORIAS.get(clave, ("Desconocido / no identificado", [], False))
 
+    # OCR reforzado SOLO si esta categoría tiene campos clave (INE: domicilio y
+    # vigencia; comprobante: fecha y domicilio) y la primera lectura no los
+    # dejó legibles. Si ya salieron bien, no se gasta ni un segundo extra.
+    paginas_texto, ocr_usado, ocr_reforzado_aplicado = _refuerza_ocr_si_hace_falta(
+        ruta, clave, paginas_texto, ocr_usado)
+    texto_completo = "\n".join(paginas_texto)
+
     fila = {
         "archivo": nombre_archivo,
         "categoria_clave": clave,
@@ -1891,6 +2317,8 @@ def procesar_documento(ruta, nombre_candidato, categoria_forzada=None):
         fila["detalle"] += f"Coincidencia de nombre: {proporcion*100:.0f}% de las palabras del nombre capturado se encontraron en el documento. "
 
     detalles_extra = []
+    if ocr_reforzado_aplicado:
+        detalles_extra.append("La primera lectura no dejó legibles los datos clave; se aplicó una lectura reforzada (OCR) a la imagen.")
 
     if clave == "CSF":
         r = analiza_csf(paginas_texto)
@@ -1973,7 +2401,7 @@ def procesar_documento(ruta, nombre_candidato, categoria_forzada=None):
         fila["vigencia_fecha_texto"] = f"Vigente hasta {r['vigencia_anio_fin']}" if r["vigencia_anio_fin"] else None
         fila["num_paginas_ok"] = r["dos_paginas"]
         detalles_extra.append(r["observaciones"])
-        direccion_ine = extraer_direccion(texto_completo, ["DOMICILIO"])
+        direccion_ine = _direccion_ine(texto_completo)
         fila["direccion"] = direccion_ine
         fila["domicilio"] = descomponer_direccion(direccion_ine)
         if direccion_ine:
@@ -1986,10 +2414,8 @@ def procesar_documento(ruta, nombre_candidato, categoria_forzada=None):
         fila["vigencia_ok"] = dentro
         fila["vigencia_fecha_texto"] = fecha.isoformat() if fecha else None
         detalles_extra.append(obs)
-        direccion_domicilio = extraer_direccion(texto_completo, [
-            "DOMICILIO DEL SERVICIO", "DOMICILIO DEL USUARIO", "NOMBRE Y DOMICILIO DEL USUARIO",
-            "DIRECCION DEL SERVICIO", "DOMICILIO DE INSTALACION", "DOMICILIO",
-        ])
+        direccion_domicilio = (extraer_domicilio_etiquetado(texto_completo)
+                               or extraer_direccion(texto_completo, _ETIQUETAS_DOMICILIO_COMPROBANTE))
         fila["direccion"] = direccion_domicilio
         fila["domicilio"] = descomponer_direccion(direccion_domicilio)
         if direccion_domicilio:
