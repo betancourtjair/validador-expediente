@@ -3023,6 +3023,7 @@ def _llenar_hoja_resumen(ws, candidato, filas, checklist, extra, fila_inicio=1):
     ine_fila = next((f for f in filas if f["categoria_clave"] == "INE"), None)
     infonavit_fila = next((f for f in filas if f["categoria_clave"] == "INFONAVIT"), None)
     fonacot_fila = next((f for f in filas if f["categoria_clave"] == "FONACOT"), None)
+    nss_fila = next((f for f in filas if f["categoria_clave"] == "NSS"), None)
 
     r += 2
     ws.cell(row=r, column=1, value="Datos extraídos de los documentos (propuesta a confirmar contra el PDF):").font = Font(bold=True)
@@ -3042,6 +3043,8 @@ def _llenar_hoja_resumen(ws, candidato, filas, checklist, extra, fila_inicio=1):
         ("CURP", *_dato(curp_fila, "curp"), "Documento CURP"),
         ("CURP (CSF)", *_dato(csf_fila, "curp"), "CSF"),
         ("Código Postal (CSF)", *_dato(csf_fila, "codigo_postal"), "CSF"),
+        ("Dirección fiscal (CSF)", *_dato(csf_fila, "direccion_fiscal"), "CSF"),
+        ("NSS (Número de Seguridad Social)", *_dato(nss_fila, "numero_seguridad_social"), "Asignación de NSS (IMSS)"),
         ("Régimen (CSF, hoja 2)", *_dato(csf_fila, "regimen"), "CSF"),
         ("Fecha de nacimiento", *_dato(acta_fila, "fecha_nacimiento_texto"), "Acta de nacimiento"),
         ("Dirección", *_dato(domicilio_fila, "direccion"), "Comprobante de domicilio"),
