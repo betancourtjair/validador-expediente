@@ -940,6 +940,34 @@ def _palabra_clave_presente(palabra, texto_norm):
     return clave in texto_norm
 
 
+def sugerir_categoria_por_contenido(texto_completo, categoria_cargada):
+    """Compara la categoría en la que el documento se CARGÓ (campo del
+    formulario o nombre del archivo) contra lo que dice su contenido. Regresa
+    (clave_sugerida, nombre_legible) solo cuando hay evidencia clara de que es
+    otro documento; si no, None. Se ignora el nombre del archivo a propósito
+    (es justo lo que puede estar equivocado) y se exige evidencia fuerte para
+    no dar falsas alarmas con escaneos de texto pobre: que el contenido no
+    respalde en absoluto la categoría cargada y que lo sugerido coincida con
+    2+ palabras clave o con una frase larga (p. ej. "CERTIFICADO MEDICO"), o
+    que lo sugerido supere por 2+ coincidencias a lo cargado."""
+    t = normaliza(texto_completo)
+    puntajes = {}
+    for clave, (_, palabras, _) in CATEGORIAS.items():
+        aciertos = [normaliza(pal) for pal in palabras if _palabra_clave_presente(pal, t)]
+        puntajes[clave] = (len(aciertos), sum(len(a) for a in aciertos))
+    mejor = max(puntajes, key=lambda c: puntajes[c])
+    n_mejor, chars_mejor = puntajes[mejor]
+    n_cargada = puntajes.get(categoria_cargada, (0, 0))[0]
+    if mejor == categoria_cargada or n_mejor == 0:
+        return None
+    if puntajes.get(categoria_cargada, (0, 0)) >= puntajes[mejor]:
+        return None
+    fuerte = n_mejor >= 2 or chars_mejor >= 12
+    if fuerte and (n_cargada == 0 or n_mejor >= n_cargada + 2):
+        return mejor, CATEGORIAS[mejor][0]
+    return None
+
+
 def clasificar(texto_completo, nombre_archivo):
     t = normaliza(texto_completo)
     nombre_arch_norm = normaliza(nombre_archivo)
@@ -2581,6 +2609,15 @@ def procesar_documento(ruta, nombre_candidato, categoria_forzada=None):
         fila["detalle"] += f"Coincidencia de nombre: {proporcion*100:.0f}% de las palabras del nombre capturado se encontraron en el documento. "
 
     detalles_extra = []
+    if categoria_forzada in CATEGORIAS:
+        sugerida = sugerir_categoria_por_contenido(texto_completo, categoria_forzada)
+        if sugerida:
+            fila["categoria_sugerida"] = sugerida[0]
+            fila["categoria_sugerida_nombre"] = sugerida[1]
+            detalles_extra.append(
+                f"⚠ POSIBLE DOCUMENTO EN EL CAMPO EQUIVOCADO: se cargó como «{nombre_legible}», pero el "
+                f"contenido parece «{sugerida[1]}». Revisar el PDF y pedir que se cargue en el campo correcto."
+            )
     if ocr_reforzado_aplicado:
         detalles_extra.append("La primera lectura no dejó legibles los datos clave; se aplicó una lectura reforzada (OCR) a la imagen.")
 
@@ -2827,6 +2864,8 @@ def construir_reporte(candidato, filas):
             "obligatorio": obligatorio,
             "recibido": len(docs) > 0,
             "archivos": [d["archivo"] for d in docs],
+            # archivos cargados aquí cuyo contenido parece de otra categoría
+            "revisar": [d["archivo"] for d in docs if d.get("categoria_sugerida")],
         })
 
     extra = []
@@ -2892,11 +2931,15 @@ def _llenar_hoja_resumen(ws, candidato, filas, checklist, extra, fila_inicio=1):
     for item in checklist:
         ws.cell(row=r, column=1, value=item["categoria"])
         ws.cell(row=r, column=2, value="Sí" if item["obligatorio"] else "Condicional (solo si aplica)")
-        celda_recibido = ws.cell(row=r, column=3, value="Sí" if item["recibido"] else "No")
-        if item["obligatorio"]:
-            celda_recibido.fill = VERDE if item["recibido"] else ROJO
+        if item.get("revisar"):
+            celda_recibido = ws.cell(row=r, column=3, value="Sí — REVISAR (parece otro documento)")
+            celda_recibido.fill = AMARILLO
         else:
-            celda_recibido.fill = VERDE if item["recibido"] else AMARILLO
+            celda_recibido = ws.cell(row=r, column=3, value="Sí" if item["recibido"] else "No")
+            if item["obligatorio"]:
+                celda_recibido.fill = VERDE if item["recibido"] else ROJO
+            else:
+                celda_recibido.fill = VERDE if item["recibido"] else AMARILLO
         ws.cell(row=r, column=4, value=", ".join(item["archivos"]) or "—")
         r += 1
 
@@ -2924,6 +2967,16 @@ def _llenar_hoja_resumen(ws, candidato, filas, checklist, extra, fila_inicio=1):
     else:
         ws.cell(row=r, column=1, value="Ninguno pendiente.")
         r += 1
+
+    mal_cargados = [f for f in filas if f.get("categoria_sugerida")]
+    if mal_cargados:
+        r += 1
+        ws.cell(row=r, column=1, value="⚠ Posibles documentos cargados en el campo equivocado (revisar el PDF):").font = Font(bold=True)
+        r += 1
+        for f in mal_cargados:
+            c = ws.cell(row=r, column=1, value=f"• {f['archivo']}: cargado como «{f['categoria']}», parece «{f['categoria_sugerida_nombre']}»")
+            c.fill = AMARILLO
+            r += 1
 
     if extra:
         r += 1
