@@ -650,6 +650,28 @@ def _ocr_reforzado_candidatos(ruta, indice_pagina, campos_ok=None):
     return candidatos
 
 
+def _tokens_largos(texto):
+    return len(re.findall(r"[A-Za-zÁÉÍÓÚÑáéíóúñ:]{22,}", texto or ""))
+
+
+def _extrae_texto_pagina(pagina):
+    """Texto nativo de la página. Algunos PDF (la CSF del SAT, por ejemplo)
+    traen los caracteres tan juntos que con la tolerancia de espacio normal
+    de pdfplumber (3) las palabras salen pegadas ("NombredelaColonia:
+    PENSILSUR"). Si el texto trae palabras absurdamente largas, se vuelve a
+    extraer con una tolerancia menor (2) y se usa esa versión solo si deja
+    menos palabras pegadas; así los PDF que ya salían bien no cambian."""
+    texto = (pagina.extract_text() or "").strip()
+    if _tokens_largos(texto) >= 1:
+        try:
+            alt = (pagina.extract_text(x_tolerance=2) or "").strip()
+        except Exception:
+            alt = ""
+        if alt and _tokens_largos(alt) < _tokens_largos(texto):
+            return alt
+    return texto
+
+
 def extraer_texto_pdf(ruta):
     """Regresa (lista_de_texto_por_pagina, num_paginas, uso_ocr_por_pagina).
 
@@ -679,7 +701,7 @@ def extraer_texto_pdf(ruta):
     with pdfplumber.open(ruta) as pdf:
         num_paginas = len(pdf.pages)
         for pagina in pdf.pages:
-            texto = (pagina.extract_text() or "").strip()
+            texto = _extrae_texto_pagina(pagina)
             paginas_texto.append(texto)
             ocr_usado.append(False)
             es_escaneo.append(_pagina_parece_escaneo(pagina))
@@ -1068,8 +1090,55 @@ def extraer_curp(texto_completo):
     lo trae impreso), buscando la cadena de 18 caracteres con el formato
     oficial. Regresa el CURP detectado o None si no se encontró nada con ese
     formato."""
-    m = PATRON_CURP.search(normaliza(texto_completo))
-    return m.group(1) if m else None
+    t = normaliza(texto_completo)
+    m = PATRON_CURP.search(t)
+    if m:
+        return m.group(1)
+    return _curp_reparado_por_ocr(t)
+
+
+_CURP_A_DIGITO = {"O": "0", "Q": "0", "D": "0", "I": "1", "L": "1", "B": "8", "S": "5", "Z": "2"}
+_CURP_A_LETRA = {"0": "O", "1": "I", "8": "B", "5": "S", "2": "Z", "6": "G"}
+
+
+def _curp_valido_estricto(c):
+    if not re.fullmatch(r"[A-Z]{4}\d{6}[HM][A-Z]{2}[B-DF-HJ-NP-TV-Z]{3}[A-Z0-9]\d", c):
+        return False
+    mes, dia = int(c[6:8]), int(c[8:10])
+    return 1 <= mes <= 12 and 1 <= dia <= 31 and c[11:13] in CURP_ESTADOS
+
+
+def _curp_por_posicion(s):
+    """Corrige confusiones típicas del OCR (O/0, I/1, B/8...) según lo que
+    cada posición del CURP puede ser (letra o dígito)."""
+    out = list(s)
+    for i, ch in enumerate(out):
+        if 4 <= i <= 9 or i == 17:
+            out[i] = _CURP_A_DIGITO.get(ch, ch)
+        elif i in (0, 1, 2, 3, 10, 11, 12, 13, 14, 15):
+            out[i] = _CURP_A_LETRA.get(ch, ch)
+    return "".join(out)
+
+
+def _curp_reparado_por_ocr(t_norm):
+    """Respaldo cuando el OCR leyó mal un carácter del CURP (p.ej.
+    "LOCR0O80416MMCPDNAO", con un 0 de más y una O por 0 al final). Busca
+    cadenas de 18 o 19 caracteres, corrige por posición y, si son 19, prueba
+    quitar cada carácter; solo acepta un resultado que cumple TODA la
+    estructura (fecha real, sexo, clave de entidad válida, consonantes)."""
+    for m in re.finditer(r"(?<![A-Z0-9])[A-Z0-9]{18,19}(?![A-Z0-9])", t_norm):
+        token = m.group(0)
+        variantes = [token] if len(token) == 18 else [token[:i] + token[i + 1:] for i in range(len(token))]
+        mejor = None
+        for v in variantes:
+            c = _curp_por_posicion(v)
+            if _curp_valido_estricto(c):
+                costo = sum(1 for a, b in zip(v, c) if a != b)
+                if mejor is None or costo < mejor[0]:
+                    mejor = (costo, c)
+        if mejor:
+            return mejor[1]
+    return None
 
 
 # Número de Seguridad Social (NSS): 11 dígitos, impreso en la constancia de
@@ -1249,6 +1318,9 @@ def extraer_domicilio_csf(texto_completo):
         t, _CSF_ETQ_NUMERO_INTERIOR, [_CSF_ETQ_COLONIA, _CSF_ETQ_LOCALIDAD]
     )
     numero_interior = None
+    if numero_interior_bruto:
+        # la CSF suele imprimir el valor con prefijo ("INT 14", "INT14")
+        numero_interior_bruto = re.sub(r"^(?:INTERIOR|INT)\.?\s*", "", numero_interior_bruto).strip(" .:-") or ""
     if numero_interior_bruto and re.match(r"^(?:[0-9][0-9A-Z\-\.]{0,9}|[A-Z]{1,2})$", numero_interior_bruto):
         numero_interior = numero_interior_bruto
 
@@ -1547,6 +1619,74 @@ def extraer_direccion(texto_completo, etiquetas, ventana=220, max_lineas=4):
     return None
 
 
+def extraer_direccion_recibo_cfe(texto):
+    """Recibo de CFE: el domicilio NO lleva etiqueta, va en el encabezado
+    debajo del nombre del titular y antes de "NO. DE SERVICIO":
+
+        IDALIA PEREZ DE LOPE                      TOTAL A PAGAR:
+        DOROTEA MZ 17 LT 12                       $410
+        CABALLO CALVILENO Y GUILLERMO DE MAMBRINO
+        LA MANCHA II. C.P. 53717                  (CUATROCIENTOS DIEZ PESOS M.N)
+        NAUCALPAN DE JUAREZ, MEX.
+        NO. DE SERVICIO: 140890300274
+
+    Regresa "calle, colonia C.P. nnnnn, municipio, estado" (se omite la línea
+    de "entre calles" de en medio) o None si el texto no es un recibo de CFE
+    o no se encuentra el bloque."""
+    if not texto:
+        return None
+    plano = _sin_acentos_mismo_largo(texto).upper()
+    if "ELECTRICIDAD" not in plano and "CFE" not in plano:
+        return None
+    lineas = texto.split("\n")
+    lineas_plano = plano.split("\n")
+    idx_serv = next((i for i, l in enumerate(lineas_plano) if re.search(r"N[O0]\.?\s*DE\s*SERVICIO", l)), None)
+    if idx_serv is None:
+        return None
+    desde = max(0, idx_serv - 9)
+    idx_total = idx_rfc = None
+    for i in range(idx_serv - 1, desde - 1, -1):
+        if idx_total is None and "TOTAL A PAGAR" in lineas_plano[i]:
+            idx_total = i
+        if idx_rfc is None and re.search(r"RFC\s*:?\s*CFE", lineas_plano[i]):
+            idx_rfc = i
+    if idx_total is not None:
+        inicio = idx_total + 1
+    elif idx_rfc is not None:
+        inicio = idx_rfc + 2
+    else:
+        return None
+
+    limpias = []
+    for linea in lineas[inicio:idx_serv]:
+        l = re.sub(r"TOTAL\s*A\s*PAGAR\s*:?", " ", linea, flags=re.IGNORECASE)
+        l = re.sub(r"\([^)]*PESOS[^)]*\)?", " ", l, flags=re.IGNORECASE)
+        l = re.sub(r"\$\s*[\d.,\s]*", " ", l)
+        l = re.sub(r"[|\\<>~_*^!¡]+", " ", l)
+        l = re.sub(r"\s+", " ", l).strip(" :-\t")
+        l = re.sub(r"\s+\d{1,3}[A-Z]{1,2}$", "", l)  # "25H": resto del monto
+        l = re.sub(r"\bl{2}\b", "II", l)  # "LA MANCHA ll." -> "LA MANCHA II."
+        l = l.rstrip(" .")
+        if l:
+            limpias.append(l)
+    if len(limpias) < 2:
+        return None
+    ultimo = limpias[-1]
+    previas = limpias[:-1]
+    if len(previas) >= 3:
+        previas = [previas[0], previas[-1]]  # se omite "entre calles"
+    direccion = ", ".join(previas + [ultimo])
+    if not re.search(r"C\.?\s*P\.?\s*:?\s*\d{5}", direccion, flags=re.IGNORECASE):
+        return None
+    return direccion
+
+
+def _direccion_comprobante(texto):
+    return (extraer_domicilio_etiquetado(texto)
+            or extraer_direccion_recibo_cfe(texto)
+            or extraer_direccion(texto, _ETIQUETAS_DOMICILIO_COMPROBANTE))
+
+
 def extraer_domicilio_etiquetado(texto):
     """Recibos (Naturgy, CFE, agua...) que imprimen el domicilio como campos
     con etiqueta en vez de un bloque "DOMICILIO":
@@ -1628,7 +1768,7 @@ def _campos_clave_comprobante(texto):
     """(campos_ok, total) para el comprobante de domicilio: una fecha que
     permita calcular la vigencia y un domicilio."""
     _, _, fecha = analiza_comprobante_domicilio(texto)
-    direccion = extraer_domicilio_etiquetado(texto) or extraer_direccion(texto, _ETIQUETAS_DOMICILIO_COMPROBANTE)
+    direccion = _direccion_comprobante(texto)
     return int(fecha is not None) + int(bool(direccion)), 2
 
 
@@ -1638,6 +1778,11 @@ def _campos_clave_cuenta(texto):
     r = analiza_cuenta_bancaria(texto, "")
     ok = bool(r["clabe_detectada"] and _clabe_valida(r["clabe_detectada"])) or bool(r["numero_cuenta"])
     return int(ok), 1
+
+
+def _campos_clave_curp(texto):
+    """(campos_ok, total) para el documento CURP: la clave de 18 caracteres."""
+    return int(extraer_curp(texto) is not None), 1
 
 
 def _campos_clave_csf(texto):
@@ -1665,6 +1810,7 @@ _CAMPOS_CLAVE_POR_CATEGORIA = {
     "COMPROBANTE_DOMICILIO": _campos_clave_comprobante,
     "CUENTA_BANCARIA": _campos_clave_cuenta,
     "CSF": _campos_clave_csf,
+    "CURP": _campos_clave_curp,
 }
 
 
@@ -1700,7 +1846,7 @@ def _refuerza_ocr_si_hace_falta(ruta, clave, paginas_texto, ocr_usado):
         return paginas_texto, ocr_usado, False
     paginas, ocr, aplicado = list(paginas_texto), list(ocr_usado), False
     # INE: solo la cara frontal (página 1); comprobante: hasta 2 páginas.
-    limite = 1 if clave in ("INE", "CSF") else min(len(paginas), 2)
+    limite = 1 if clave in ("INE", "CSF", "CURP") else min(len(paginas), 2)
     for i in range(limite):
         original = paginas[i]
         candidatos = _ocr_reforzado_candidatos(ruta, i, campos_ok=lambda t, o=original: chequeo(t + "\n" + o))
@@ -1743,7 +1889,7 @@ ESTADOS_MEXICO_ALIAS = {
     "GUERRERO", "GRO",
     "HIDALGO", "HGO",
     "JALISCO", "JAL",
-    "ESTADO DE MEXICO", "EDOMEX", "EDO MEX", "EDO DE MEXICO",
+    "ESTADO DE MEXICO", "EDOMEX", "EDO MEX", "EDO DE MEXICO", "MEX",
     "MICHOACAN", "MICH", "MICHOACAN DE OCAMPO",
     "MORELOS", "MOR",
     "NAYARIT", "NAY",
@@ -1808,11 +1954,22 @@ def descomponer_direccion(direccion):
     # "México" como país no se necesita aislar aquí (va en su propia
     # columna, con un valor fijo); se quita si aparece suelto al final
     # para que no se confunda con el Estado.
-    texto = re.sub(r",?\s*M[EÉ]XICO\s*$", "", texto, flags=re.IGNORECASE).strip(" ,")
+    texto = re.sub(r",\s*M[EÉ]XICO\s*$", "", texto, flags=re.IGNORECASE).strip(" ,")
 
     partes = [p.strip() for p in texto.split(",") if p.strip()]
     if not partes:
         return resultado
+
+    # Basura del OCR pegada después del estado ("CDMX Oe", "MEX e"): se quitan
+    # las palabras de 1-2 letras del final solo si lo que queda termina en un
+    # estado reconocible.
+    palabras_fin = partes[-1].split()
+    for quitar in (1, 2):
+        if len(palabras_fin) > quitar and all(len(w) <= 2 and w.isalpha() for w in palabras_fin[-quitar:]):
+            resto_fin = palabras_fin[:-quitar]
+            if any(_es_estado_mexico(normaliza(" ".join(resto_fin[-n:]))) for n in (1, 2, 3) if len(resto_fin) >= n):
+                partes[-1] = " ".join(resto_fin)
+                break
 
     idx_estado = None
     estado_texto = None
@@ -1865,7 +2022,7 @@ def descomponer_direccion(direccion):
     # dígitos en domicilios de un solo renglón (calle+número), donde un
     # número exterior tan largo sería rarísimo pero no imposible.
     if resultado["codigo_postal"] is None and len(resto) >= 2:
-        m_cp_suelto = re.search(r"(?<!\d)(\d{5})\s*$", resto[-1])
+        m_cp_suelto = re.search(r"(?<!\d)(\d{5})(?:\s+[A-Za-z]{1,2})?\s*$", resto[-1])
         if m_cp_suelto:
             resultado["codigo_postal"] = m_cp_suelto.group(1)
             recorte = resto[-1][:m_cp_suelto.start()].strip(" ,.-")
@@ -1885,12 +2042,17 @@ def descomponer_direccion(direccion):
         # REFORMA 100 INT 4B") se separa ANTES que el exterior: si no, el
         # exterior se lo llevaría por error (es el que queda más a la
         # derecha del renglón).
-        m_int = re.search(r"\bINT(?:ERIOR)?\.?\s*([A-Za-z0-9\-]+)$", primero, flags=re.IGNORECASE)
+        m_int = re.search(r"\bINT(?:ERIOR)?\.?\s*([A-Za-z0-9\-]+(?:\s+[A-Za-z])?)$", primero, flags=re.IGNORECASE)
         if m_int:
             resultado["numero_interior"] = m_int.group(1)
             primero = primero[:m_int.start()].strip(" ,.-")
+        # "DOROTEA MZ 17 LT 12": manzana y lote juntos son el número exterior
+        m_mzlt = re.search(r"\s+((?:MZA?|MANZANA)\.?\s*\d+\s*(?:LT|LOTE)\.?\s*\d+)$", primero, flags=re.IGNORECASE)
+        if m_mzlt:
+            resultado["numero_exterior"] = m_mzlt.group(1)
+            primero = primero[:m_mzlt.start()].strip(" ,.-")
         palabras = primero.split()
-        if len(palabras) >= 2 and re.match(r"^\d+[A-Za-z]?$", palabras[-1]):
+        if resultado["numero_exterior"] is None and len(palabras) >= 2 and re.match(r"^\d+[A-Za-z]?$", palabras[-1]):
             resultado["numero_exterior"] = palabras[-1]
             primero = " ".join(palabras[:-1])
         resultado["calle"] = primero or None
@@ -2516,8 +2678,7 @@ def procesar_documento(ruta, nombre_candidato, categoria_forzada=None):
         fila["vigencia_ok"] = dentro
         fila["vigencia_fecha_texto"] = fecha.isoformat() if fecha else None
         detalles_extra.append(obs)
-        direccion_domicilio = (extraer_domicilio_etiquetado(texto_completo)
-                               or extraer_direccion(texto_completo, _ETIQUETAS_DOMICILIO_COMPROBANTE))
+        direccion_domicilio = _direccion_comprobante(texto_completo)
         fila["direccion"] = direccion_domicilio
         fila["domicilio"] = descomponer_direccion(direccion_domicilio)
         if direccion_domicilio:
@@ -2622,7 +2783,36 @@ def procesar_zip_candidato_progresivo(ruta_zip, nombre_candidato, dir_extraccion
     return filas
 
 
+def _concilia_fecha_nacimiento(filas):
+    """Valida la fecha de nacimiento leída del acta contra la que lleva
+    incrustada el CURP (AAMMDD). El OCR del acta confunde dígitos con
+    facilidad (2008 -> 2003) y esa fecha alimenta la edad y "Datos
+    completos", mientras que el CURP (documento o CSF) la trae de forma
+    estructurada. Si difieren, se usa la del CURP y se deja un aviso en las
+    observaciones del acta. Modifica 'filas' en sitio."""
+    acta = next((f for f in filas if f["categoria_clave"] == "ACTA_NACIMIENTO"), None)
+    if not acta or not acta.get("fecha_nacimiento"):
+        return
+    curp_fila = next((f for f in filas if f["categoria_clave"] == "CURP" and f.get("curp")), None)
+    csf_fila = next((f for f in filas if f["categoria_clave"] == "CSF" and f.get("curp")), None)
+    curp = (curp_fila or {}).get("curp") or (csf_fila or {}).get("curp")
+    if not curp:
+        return
+    derivada = datos_derivados_de_curp(curp).get("fecha_nacimiento")
+    if not derivada or derivada == acta["fecha_nacimiento"]:
+        return
+    leida = acta.get("fecha_nacimiento_texto")
+    acta["fecha_nacimiento"] = derivada
+    acta["fecha_nacimiento_texto"] = derivada.strftime("%d/%m/%Y")
+    acta["detalle"] = (acta.get("detalle") or "") + (
+        f" AVISO: la fecha de nacimiento leída del acta ({leida}) no coincide con la que trae el CURP "
+        f"({acta['fecha_nacimiento_texto']}); se usó la del CURP (el OCR del acta pudo confundir un dígito). "
+        "Revisar contra el PDF."
+    )
+
+
 def construir_reporte(candidato, filas):
+    _concilia_fecha_nacimiento(filas)
     encontrados_por_categoria = {}
     for fila in filas:
         encontrados_por_categoria.setdefault(fila["categoria_clave"], []).append(fila)
