@@ -25,11 +25,15 @@ COPY . .
 ENV PORT=10000
 EXPOSE 10000
 
-# 1 solo worker (el plan gratuito de Render trae solo 512 MB / 0.1 CPU; dos
+# Cloud Run (2 GiB / 2 CPU): 1 proceso con 8 hilos para que varios
+# reclutadores puedan cargar a la vez (el OCR corre en subprocesos de
+# tesseract, así que los hilos sí avanzan en paralelo). Antes había 1 solo
+# worker síncrono y una carga lenta bloqueaba a todos los demás.
+# (Nota histórica: en Render, el plan gratuito de Render trae solo 512 MB / 0.1 CPU; dos
 # workers corriendo OCR al mismo tiempo se quedarían sin memoria) y timeout
 # largo (30 min): con varios documentos escaneados en un mismo expediente,
 # el OCR puede tardar bastante más en este tipo de instancia que en una
 # máquina de desarrollo normal, y la carga masiva (/validar_lote) puede
 # procesar hasta 10 candidatos en una sola petición — hay que dejarle
 # tiempo de sobra a gunicorn para que no corte la conexión a la mitad.
-CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT} --workers 1 --timeout 1800 app:app"]
+CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT} --workers 1 --worker-class gthread --threads 8 --timeout 1800 --keep-alive 75 app:app"]

@@ -51,11 +51,13 @@ import base64
 import datetime
 import json
 import os
+import queue
 import re
 import secrets
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import zipfile
 from functools import wraps
@@ -558,7 +560,26 @@ function configurarFormularioConProgreso(opciones) {
 
     var datos = new FormData(form);
 
-    fetch(form.getAttribute("action"), { method: "POST", body: datos })
+    var totalBytes = 0;
+    datos.forEach(function (v) { if (v && typeof v === "object" && v.size) totalBytes += v.size; });
+    var mb = (totalBytes / 1048576).toFixed(1);
+
+    // Si la conexión se cae ANTES de que el servidor responda (típico en
+    // celulares con señal débil o pantalla que se bloquea), se reintenta una
+    // sola vez sola; el servidor aún no había empezado a procesar nada.
+    function enviar(intento) {
+      return fetch(form.getAttribute("action"), { method: "POST", body: datos })
+        .catch(function (err) {
+          if (intento < 2 && err && err.name !== "AbortError") {
+            barraTexto.textContent = "Se cortó la conexión, reintentando...";
+            return new Promise(function (ok) { setTimeout(ok, 3000); })
+              .then(function () { return enviar(intento + 1); });
+          }
+          throw err;
+        });
+    }
+
+    enviar(1)
       .then(function (resp) {
         if (!resp.ok) {
           // Un 413 lo regresa la plataforma (Cloud Run/GFE) ANTES de que la
@@ -635,7 +656,14 @@ function configurarFormularioConProgreso(opciones) {
         }
       })
       .catch(function (err) {
-        terminar("Ocurrió un error: " + err.message + " (no se borró nada, puedes reintentar).", true);
+        var red = (err && (err.name === "TypeError" || /failed to fetch|load failed|network/i.test(err.message || "")));
+        if (red) {
+          terminar("Se perdió la conexión con el servidor (se intentó dos veces; " + mb + " MB en total). " +
+            "No se borró nada: conéctate a una red estable (mejor WiFi), mantén la pantalla encendida y la pestaña abierta, e inténtalo de nuevo. " +
+            "Si sigue pasando, avisa a Jair indicando el tamaño de tus archivos.", true);
+        } else {
+          terminar("Ocurrió un error: " + err.message + " (no se borró nada, puedes reintentar).", true);
+        }
       });
   });
 }
@@ -986,6 +1014,41 @@ def _evento_sse(datos_dict):
     return "data: " + json.dumps(datos_dict, ensure_ascii=False) + "\n\n"
 
 
+def _con_latidos(generador, cada=8.0):
+    """Corre 'generador' en un hilo y reenvía sus eventos; mientras el hilo
+    está ocupado (OCR de un PDF pesado puede tardar bastante sin ceder
+    ningún evento) manda un comentario SSE cada 'cada' segundos para que ni
+    el celular, ni la red móvil ni el balanceador de Cloud Run den por
+    muerta una conexión que no ha movido ni un byte. El navegador ignora
+    estas líneas (solo procesa las que empiezan con "data:").
+
+    Si el cliente se desconecta, el hilo sigue hasta terminar (el expediente
+    se guarda igual) y limpia su directorio temporal en su propio "finally".
+    """
+    cola = queue.Queue()
+    fin = object()
+
+    def trabajo():
+        try:
+            for evento in generador:
+                cola.put(evento)
+        except Exception as e:
+            cola.put(_evento_sse({"tipo": "error", "error": str(e)}))
+        finally:
+            cola.put(fin)
+
+    threading.Thread(target=trabajo, daemon=True).start()
+    while True:
+        try:
+            evento = cola.get(timeout=cada)
+        except queue.Empty:
+            yield ": latido\n\n"
+            continue
+        if evento is fin:
+            return
+        yield evento
+
+
 def _generar_eventos_validacion(tmp, rutas, candidato, categoria_por_ruta=None):
     """Generador que hace todo el trabajo (OCR + Excel) y va cediendo (yield)
     un evento de progreso por cada documento, todo DENTRO de la misma
@@ -1158,7 +1221,7 @@ def validar():
         return f"Ocurrió un error recibiendo los documentos: {e}", 500
 
     respuesta = Response(
-        stream_with_context(_generar_eventos_validacion(tmp, rutas, candidato, categoria_por_ruta)),
+        stream_with_context(_con_latidos(_generar_eventos_validacion(tmp, rutas, candidato, categoria_por_ruta))),
         mimetype="text/event-stream",
     )
     # Evita que algún proxy intermedio (nginx, el balanceador de Render/Cloud
@@ -1385,7 +1448,7 @@ def validar_lote():
         return f"Ocurrió un error recibiendo los archivos: {e}", 500
 
     respuesta = Response(
-        stream_with_context(_generar_eventos_validacion_lote(tmp_raiz, candidatos, reclutador)),
+        stream_with_context(_con_latidos(_generar_eventos_validacion_lote(tmp_raiz, candidatos, reclutador))),
         mimetype="text/event-stream",
     )
     respuesta.headers["Cache-Control"] = "no-cache"
