@@ -23,6 +23,8 @@ COPY . .
 # Render (y la mayoría de hostings) inyectan la variable PORT en tiempo de
 # ejecución; 10000 es solo un valor por default para pruebas locales con Docker.
 ENV PORT=10000
+# un hilo por proceso de tesseract (ver validador_expediente.py)
+ENV OMP_THREAD_LIMIT=1
 EXPOSE 10000
 
 # Cloud Run (2 GiB / 2 CPU): 1 proceso con 8 hilos para que varios

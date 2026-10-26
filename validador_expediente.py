@@ -79,6 +79,7 @@ en el sistema los binarios `tesseract` (con el paquete de idioma `spa`) y
 
 import argparse
 import datetime
+import difflib
 import io
 import os
 import re
@@ -86,6 +87,18 @@ import sys
 import time
 import unicodedata
 import zipfile
+
+# Tesseract usa OpenMP y, por defecto, un hilo por CPU: con 2 vCPU (Cloud Run)
+# y varios procesos a la vez los hilos se estorban entre sí y los escaneos
+# grandes pasaban de 90 s y terminaban SIN LEER NADA (timeout), aun solos
+# -medido con un acta de 1834x2381: 75 s y 0 caracteres contra 51 s y texto
+# completo con un solo hilo; el certificado de estudios, 89 s sin texto
+# contra 3 s-. Un hilo por proceso de Tesseract es lo recomendado por el
+# propio proyecto cuando se corren varios a la vez. Debe fijarse ANTES de
+# lanzar el primer tesseract.
+os.environ.setdefault("OMP_THREAD_LIMIT", "1")
+
+import threading
 
 import pdfplumber
 from pdf2image import convert_from_path
@@ -378,6 +391,15 @@ def _extraer_imagenes_incrustadas(ruta, indice_pagina):
             if indice_pagina >= len(pdf.pages):
                 return []
             pagina = pdf.pages[indice_pagina]
+            # Un escaneo guardado "de lado" trae la imagen en su orientación
+            # original y le pone /Rotate a la PÁGINA para que se vea derecha;
+            # al sacar la imagen tal cual hay que aplicar ese mismo giro, si
+            # no el OCR la lee acostada o de cabeza (caso real: un recibo
+            # Telmex que salía como basura).
+            try:
+                giro = int(pagina.page_obj.attrs.get("Rotate") or 0) % 360
+            except Exception:
+                giro = 0
             candidatas = sorted(pagina.images, key=lambda im: im.get("top", 0))
             for im in candidatas:
                 ancho, alto = im.get("srcsize", (0, 0))
@@ -386,6 +408,8 @@ def _extraer_imagenes_incrustadas(ruta, indice_pagina):
                 try:
                     datos = im["stream"].get_data()
                     imagen = Image.open(io.BytesIO(datos)).convert("RGB")
+                    if giro in (90, 180, 270):
+                        imagen = imagen.rotate(-giro, expand=True)
                     imagenes.append(imagen)
                 except Exception:
                     continue
@@ -475,6 +499,15 @@ def _calidad_texto(texto):
     cortas = sum(1 for l in lineas if len(l) <= 2) / max(1, len(lineas))
     simbolos = sum(texto.count(c) for c in "~•\\|<>^_{}[]¬°") / max(1, len(re.sub(r"\s", "", texto)))
     return max(0.0, base - 0.5 * cortas - 3 * simbolos)
+
+
+def _texto_con_glifos_sin_mapeo(texto):
+    """True si el texto "nativo" de la página trae glifos sin mapeo a Unicode
+    (pdfplumber los muestra como "(cid:12)"): el PDF dibuja letras con una
+    fuente embebida sin tabla ToUnicode (muy común en recibos de CFE y en
+    PDFs "imprimir a PDF"), así que lo que se ve en pantalla NO está en el
+    texto extraíble y solo se puede leer renderizando la página."""
+    return bool(texto) and len(re.findall(r"\(cid:\d+\)", texto)) >= 8
 
 
 def _pagina_parece_escaneo(pagina):
@@ -580,7 +613,7 @@ def _pasos_ocr_reforzado(bloque, limitado=False):
     ancho, alto = bloque.size
     pasos = []
     if 1.3 <= ancho / max(1, alto) <= 1.85 and ancho <= 2600:
-        col = _escala_a_ancho(bloque.crop((int(ancho * .33), int(alto * .16), int(ancho * .80), int(alto * .97))), 1200)
+        col = _escala_a_ancho(bloque.crop((int(ancho * .29), int(alto * .16), int(ancho * .80), int(alto * .97))), 1200)
         completa = _escala_a_ancho(bloque, 1800)
         g_col, g_comp = ImageOps.grayscale(col), ImageOps.grayscale(completa)
         a_col = ImageOps.autocontrast(g_col, cutoff=0)
@@ -613,7 +646,17 @@ def _ocr_reforzado_candidatos(ruta, indice_pagina, campos_ok=None):
     quien la usa puede quedarse con la mejor lectura de CADA campo en vez de
     mezclarlas todas."""
     inicio = time.monotonic()
-    imagenes = _extraer_imagenes_incrustadas(ruta, indice_pagina)
+    sin_mapeo = False
+    try:
+        with pdfplumber.open(ruta) as _pdf:
+            if indice_pagina < len(_pdf.pages):
+                sin_mapeo = _texto_con_glifos_sin_mapeo(_pdf.pages[indice_pagina].extract_text() or "")
+    except Exception:
+        sin_mapeo = False
+    # Con glifos sin mapeo la imagen incrustada suele ser solo el fondo de la
+    # plantilla (logos, gráficas); el nombre, domicilio y montos están
+    # dibujados como vectores encima, y solo salen al renderizar la página.
+    imagenes = [] if sin_mapeo else _extraer_imagenes_incrustadas(ruta, indice_pagina)
     if not imagenes:
         try:
             pag = convert_from_path(ruta, dpi=300, first_page=indice_pagina + 1, last_page=indice_pagina + 1)
@@ -714,7 +757,8 @@ def extraer_texto_pdf(ruta):
     # reemplaza SOLO si lo nuevo califica claramente mejor. Un PDF digital
     # normal (sin imagen de página completa) nunca entra aquí.
     for i, t in enumerate(paginas_texto):
-        if len(t) >= 20 and es_escaneo[i] and _calidad_texto(t) < CALIDAD_MINIMA_TEXTO_NATIVO:
+        if (len(t) >= 20 and (es_escaneo[i] or _texto_con_glifos_sin_mapeo(t))
+                and _calidad_texto(t) < CALIDAD_MINIMA_TEXTO_NATIVO):
             alt = _ocr_reforzado(ruta, i)
             if alt and _calidad_texto(alt) > _calidad_texto(t) + 0.10:
                 paginas_texto[i] = alt
@@ -1121,8 +1165,55 @@ def extraer_curp(texto_completo):
     t = normaliza(texto_completo)
     m = PATRON_CURP.search(t)
     if m:
-        return m.group(1)
+        return _corrige_curp_con_verificador(m.group(1))
     return _curp_reparado_por_ocr(t)
+
+
+_CURP_ALFABETO = "0123456789ABCDEFGHIJKLMNÑOPQRSTUVWXYZ"
+
+
+def _curp_verificador_ok(c):
+    """Valida el dígito verificador (posición 18) con el algoritmo oficial de
+    RENAPO: suma de valor*(18-posición) de los primeros 17 caracteres."""
+    if len(c) != 18 or not c[17].isdigit():
+        return False
+    suma = 0
+    for i, ch in enumerate(c[:17]):
+        v = _CURP_ALFABETO.find(ch)
+        if v < 0:
+            return False
+        suma += v * (18 - i)
+    return (10 - suma % 10) % 10 == int(c[17])
+
+
+def _corrige_curp_con_verificador(c):
+    """Si el CURP leído no cuadra con su dígito verificador, prueba cambiar
+    las confusiones típicas del OCR (O/0, I/1, B/8, S/5, Z/2, G/6) en los
+    caracteres donde cabe letra o número (homoclave) y las consonantes
+    internas, y regresa la variante que sí cuadra (la de menos cambios). Si
+    ninguna cuadra, regresa el CURP tal cual."""
+    # El diferenciador (posición 17) es un DÍGITO para quien nació antes del
+    # 2000 (año de 2 dígitos > 26 = siglo XX sin ambigüedad): una "O" ahí es
+    # un cero mal leído (caso real: "...LVCO2" por "...LVC02"). Aplica aunque
+    # el verificador cuadre, porque O y 0 pesan igual módulo 10.
+    if c[16] in _CURP_A_DIGITO and c[4:6].isdigit() and int(c[4:6]) > 26:
+        c = c[:16] + _CURP_A_DIGITO[c[16]] + c[17:]
+    if _curp_verificador_ok(c):
+        return c
+    pares = {"O": "0", "0": "O", "I": "1", "1": "I", "B": "8", "8": "B", "S": "5", "5": "S", "Z": "2", "2": "Z", "G": "6", "6": "G"}
+    posiciones = [i for i in (13, 14, 15, 16) if c[i] in pares]
+    mejor = None
+    for mascara in range(1, 1 << len(posiciones)):
+        v = list(c)
+        for k, pos in enumerate(posiciones):
+            if mascara >> k & 1:
+                v[pos] = pares[v[pos]]
+        cand = "".join(v)
+        if _curp_valido_estricto(cand) and _curp_verificador_ok(cand):
+            costo = bin(mascara).count("1")
+            if mejor is None or costo < mejor[0]:
+                mejor = (costo, cand)
+    return mejor[1] if mejor else c
 
 
 _CURP_A_DIGITO = {"O": "0", "Q": "0", "D": "0", "I": "1", "L": "1", "B": "8", "S": "5", "Z": "2"}
@@ -1263,7 +1354,42 @@ def extraer_codigo_postal_csf(texto_completo):
     return m.group(1) if m else None
 
 
-def _campo_csf_por_regex(t_norm, patron_etiqueta, patrones_fin, ventana=250):
+# Textos que NUNCA forman parte del valor de un campo del domicilio de la CSF:
+# otras etiquetas de la sección y todo el texto institucional/encabezados que
+# el OCR de una foto o de un escaneo de dos columnas revuelve entre los
+# valores ("GOB.MX SECRETARIA DE HACIENDA...", "CONSTANCIA DE SITUACION
+# FISCAL", la tabla de datos de identificación...). El valor de cada campo se
+# corta en la primera aparición de cualquiera de ellos.
+_CSF_STOPS_GLOBALES = [
+    r"TIPO\s*DE\s*VIALIDAD", r"NOMBRE\s*DE\s*VIALIDAD", r"NUMERO\s*EXTERIOR",
+    r"NOMBRE\s*DE\s*LA\s*COLONIA", r"NOMBRE\s*DE\s*LA\s*LOCALIDAD",
+    r"NOMBRE\s*DEL\s*MUNICIPIO", r"NOMBRE\s*DE\s*LA\s*ENTIDAD",
+    r"ENTRE\s*CALLE", r"\bY\s*CALLE", r"\bY\s*CALLE\b",
+    r"GOB\.?\s*MX", r"SECRETARIA", r"HACIENDA", r"SERVICIO\s*DE\s*ADMINISTRACION",
+    r"ADMINISTRACION\s*TRIBUTARIA", r"CONSTANCIA", r"CEDULA", r"ACTIVIDADES\s*ECONOMICAS",
+    r"REGIMENES", r"\bRFC\s*:", r"\bCURP\s*:", r"NOMBRE\s*\(S\)", r"PRIMER\s*APELLIDO",
+    r"SEGUNDO\s*APELLIDO", r"FECHA\s*(?:DE\s*)?INICIO", r"ESTATUS", r"FECHA\s*DE\s*ULTIMO",
+    r"NOMBRE\s*COMERCIAL", r"CODIGO\s*POSTAL", r"LUGAR\s*Y\s*FECHA", r"DATOS\s*DE\s",
+    r"\bID\s*CIF", r"\bCIF\s*:", r"VALIDA\s*TU", r"DENOMINACION", r"CONTRIBUYENTE",
+    r"[|\[\]{}<>]",
+]
+_CSF_STOP_NUMERO_INTERIOR = r"NUMERO\s*INTERIOR"
+
+
+def _limpia_valor_csf(valor):
+    """Quita símbolos de OCR y fichas sueltas de un solo carácter (típico de
+    líneas de la tabla: "MENCHACA |", "QUERETARO O") en los extremos."""
+    valor = re.sub(r"[|\[\]{}<>_~]+", " ", valor or "")
+    fichas = valor.split()
+    while fichas and re.fullmatch(r"[A-Z0-9]", fichas[-1]) and not re.fullmatch(r"\d", fichas[-1]) and len(fichas) > 1:
+        fichas.pop()
+    while fichas and fichas[0] in ("O", "I", "L", "1", "|", "-"):
+        fichas.pop(0)
+    return " ".join(fichas).strip(" :.-\t,;")
+
+
+def _campo_csf_por_regex(t_norm, patron_etiqueta, patrones_fin, ventana=250, valido=None,
+                         cortar_en_interior=True):
     """Como una versión de _campo_entre_etiquetas que tolera que la
     extracción del PDF haya pegado las palabras de la etiqueta sin espacio
     entre ellas -el mismo fenómeno ya documentado en otros campos de la CSF,
@@ -1273,21 +1399,35 @@ def _campo_csf_por_regex(t_norm, patron_etiqueta, patrones_fin, ventana=250):
     expresiones regulares (normalmente con \\s* entre palabras, que también
     matchea CERO espacios) en vez de texto literal.
 
-    Regresa el texto que sigue a la etiqueta, cortado en la primera
-    coincidencia de cualquiera de 'patrones_fin' (se prueban todas y se usa
-    la que aparezca más cerca); si ninguna aparece, se recorta a 120
-    caracteres como respaldo. None si la etiqueta de inicio no se
-    encontró."""
-    m = re.search(patron_etiqueta, t_norm)
-    if not m:
+    Revisa TODAS las apariciones de la etiqueta (un escaneo o una CSF leída
+    con varios pases de OCR repite la sección) y corta cada valor en la
+    primera etiqueta/encabezado ajeno (ver _CSF_STOPS_GLOBALES), de modo que
+    nunca se cuele texto institucional o de otros campos. Entre los valores
+    que pasan 'valido' (callable opcional) se elige el que más se repite
+    (empate: el primero); si ninguno pasa, el primero no vacío. None si la
+    etiqueta no aparece o todos los valores quedaron vacíos."""
+    stops = list(patrones_fin) + _CSF_STOPS_GLOBALES + ([_CSF_STOP_NUMERO_INTERIOR] if cortar_en_interior else [])
+    candidatos = []
+    for m in re.finditer(patron_etiqueta, t_norm):
+        resto = t_norm[m.end():m.end() + ventana]
+        fin = 120
+        for patron_fin in stops:
+            m_fin = re.search(patron_fin, resto)
+            if m_fin and m_fin.start() < fin:
+                fin = m_fin.start()
+        v = _limpia_valor_csf(resto[:fin])
+        if v:
+            candidatos.append(v)
+    if not candidatos:
         return None
-    resto = t_norm[m.end():m.end() + ventana]
-    fin = 120
-    for patron_fin in patrones_fin:
-        m_fin = re.search(patron_fin, resto)
-        if m_fin and m_fin.start() < fin:
-            fin = m_fin.start()
-    return resto[:fin].strip(" :.-\t")
+    if valido is not None:
+        buenos = [c for c in candidatos if valido(c)]
+        if buenos:
+            cuenta = {}
+            for c in buenos:
+                cuenta[c] = cuenta.get(c, 0) + 1
+            return max(buenos, key=lambda c: (cuenta[c], -buenos.index(c)))
+    return candidatos[0]
 
 
 _CSF_ETQ_TIPO_VIALIDAD = r"TIPO\s*DE\s*VIALIDAD"
@@ -1330,33 +1470,43 @@ def extraer_domicilio_csf(texto_completo):
     texto ya armado; si no se encontró la sección, todo queda en None."""
     t = normaliza(texto_completo)
 
-    tipo_vialidad = _campo_csf_por_regex(t, _CSF_ETQ_TIPO_VIALIDAD, [_CSF_ETQ_NOMBRE_VIALIDAD])
-    nombre_vialidad = _campo_csf_por_regex(t, _CSF_ETQ_NOMBRE_VIALIDAD, [_CSF_ETQ_NUMERO_EXTERIOR])
-    numero_exterior = _campo_csf_por_regex(
-        t, _CSF_ETQ_NUMERO_EXTERIOR, [_CSF_ETQ_NUMERO_INTERIOR, _CSF_ETQ_COLONIA]
-    )
+    def _corto_sin_digitos(v):
+        return len(v) <= 40 and not re.search(r"[0-9:]", v)
 
-    colonia_bruta = _campo_csf_por_regex(t, _CSF_ETQ_COLONIA, [_CSF_ETQ_LOCALIDAD])
+    tipo_vialidad = _campo_csf_por_regex(
+        t, _CSF_ETQ_TIPO_VIALIDAD, [_CSF_ETQ_NOMBRE_VIALIDAD],
+        valido=lambda v: len(v) <= 25 and not re.search(r"[0-9:]", v))
+    nombre_vialidad = _campo_csf_por_regex(
+        t, _CSF_ETQ_NOMBRE_VIALIDAD, [_CSF_ETQ_NUMERO_EXTERIOR],
+        valido=lambda v: len(v) <= 45 and ":" not in v)
+    numero_exterior = _campo_csf_por_regex(
+        t, _CSF_ETQ_NUMERO_EXTERIOR, [_CSF_ETQ_NUMERO_INTERIOR, _CSF_ETQ_COLONIA],
+        valido=lambda v: bool(re.fullmatch(
+            r"(?:[0-9][0-9A-Z\-\./ ]{0,18}|S/N|SN|(?:MZA?|MANZANA|LT|LOTE)\b[0-9A-Z\-\./ ]{0,24})", v)))
+
+    colonia_bruta = _campo_csf_por_regex(
+        t, _CSF_ETQ_COLONIA, [_CSF_ETQ_LOCALIDAD], cortar_en_interior=False,
+        valido=lambda v: len(v) <= 60 and ":" not in v)
     colonia = None
     if colonia_bruta is not None:
         colonia = re.sub(_CSF_ETQ_NUMERO_INTERIOR + r"\s*:?\s*", " ", colonia_bruta)
         colonia = re.sub(r"\s+", " ", colonia).strip(" ,") or None
 
     numero_interior_bruto = _campo_csf_por_regex(
-        t, _CSF_ETQ_NUMERO_INTERIOR, [_CSF_ETQ_COLONIA, _CSF_ETQ_LOCALIDAD]
-    )
+        t, _CSF_ETQ_NUMERO_INTERIOR, [_CSF_ETQ_COLONIA, _CSF_ETQ_LOCALIDAD], cortar_en_interior=False)
     numero_interior = None
     if numero_interior_bruto:
         # la CSF suele imprimir el valor con prefijo ("INT 14", "INT14")
         numero_interior_bruto = re.sub(r"^(?:INTERIOR|INT)\.?\s*", "", numero_interior_bruto).strip(" .:-") or ""
-    if numero_interior_bruto and re.match(r"^(?:[0-9][0-9A-Z\-\.]{0,9}|[A-Z]{1,2})$", numero_interior_bruto):
+    if numero_interior_bruto and re.match(r"^(?:[0-9][0-9A-Z\-\.]{0,9}|[A-Z]{1,2})$", numero_interior_bruto) \
+            and not re.fullmatch(r"0+", numero_interior_bruto):  # "Número Interior: 0" = sin interior
         numero_interior = numero_interior_bruto
 
-    localidad = _campo_csf_por_regex(t, _CSF_ETQ_LOCALIDAD, [_CSF_ETQ_MUNICIPIO])
-    municipio = _campo_csf_por_regex(t, _CSF_ETQ_MUNICIPIO, [_CSF_ETQ_ENTIDAD])
+    localidad = _campo_csf_por_regex(t, _CSF_ETQ_LOCALIDAD, [_CSF_ETQ_MUNICIPIO], valido=_corto_sin_digitos)
+    municipio = _campo_csf_por_regex(t, _CSF_ETQ_MUNICIPIO, [_CSF_ETQ_ENTIDAD], valido=_corto_sin_digitos)
     entidad = _campo_csf_por_regex(
-        t, _CSF_ETQ_ENTIDAD, [_CSF_ETQ_ENTRE_CALLE, _CSF_ETQ_Y_CALLE, _CSF_ETQ_FIN_SECCION]
-    )
+        t, _CSF_ETQ_ENTIDAD, [_CSF_ETQ_ENTRE_CALLE, _CSF_ETQ_Y_CALLE, _CSF_ETQ_FIN_SECCION],
+        valido=lambda v: _es_estado_mexico(v))
     codigo_postal = extraer_codigo_postal_csf(texto_completo)
 
     resultado = {
@@ -1520,6 +1670,145 @@ def extraer_nombres_csf_bien_espaciado(texto_completo, apellido_paterno, apellid
     return extraer_nombres_csf(texto_completo)
 
 
+# ---------------------------------------------------------------------------
+# Nombre del candidato por consenso entre documentos.
+#
+# La CSF es la fuente "oficial" de Nombre(s)/Apellidos, pero cuando viene de
+# una foto/escaneo el OCR puede dejar el nombre con una letra de más ("AXEL
+# SAIDb"), revolver las columnas de la tabla o no encontrarlo. Para no depender
+# de un solo documento se leen también el NSS (IMSS, con etiquetas) y la
+# credencial INE (apellido paterno, materno y nombres en ese orden), y se
+# comparan contra el nombre que capturó el reclutador en el formulario: se usa
+# la lectura que mejor cuadra y las palabras mal leídas se corrigen con la
+# versión que sí coincide (una letra de más/menos).
+# ---------------------------------------------------------------------------
+def _tokens_nombre(s):
+    return re.findall(r"[A-ZÑ]+", normaliza(s or "").replace("Ñ", "N").upper()) if s else []
+
+
+def extraer_nombres_nss(texto_completo):
+    """(nombres, primer_apellido, segundo_apellido) del formato "Asignación de
+    Número de Seguridad Social" del IMSS ("Nombre(s): AXEL SAID  Primer
+    apellido: MELO  Segundo apellido: SANCHEZ") o None."""
+    t = normaliza(texto_completo)
+    m = re.search(
+        r"NOMBRE\s*\(S\)\s*:?\s*([A-Z ]{2,60}?)\s*PRIMER\s*APELLIDO\s*:?\s*([A-Z ]{2,40}?)\s*SEGUNDO\s*APELLIDO\s*:?\s*([A-Z ]{0,40}?)\s*(?:SEXO|FECHA|LUGAR|ESTE|$)",
+        t)
+    if not m:
+        return None
+    n, a, b = (re.sub(r"\s+", " ", x).strip() for x in m.groups())
+    return (n or None, a or None, b or None) if n and a else None
+
+
+def extraer_nombres_ine(texto_completo):
+    """Lista de (nombres, apellido_paterno, apellido_materno) leídas del bloque
+    "NOMBRE" de la cara frontal del INE: renglón 1 = apellido paterno,
+    renglón 2 = materno, renglón 3 = nombre(s). Puede haber varias lecturas
+    (el OCR reforzado repite el bloque); cada una se limpia de fichas que no
+    son palabras en mayúsculas. Regresa [] si no se encuentra."""
+    lineas = (texto_completo or "").split("\n")
+    salida = []
+    for i, linea in enumerate(lineas):
+        plano = _sin_acentos_mismo_largo(linea).upper().strip()
+        if not re.match(r"^\W*[JN]?OMBRE\b", plano) and plano != "NOMBRE":
+            continue
+        piezas = []
+        for sig in lineas[i + 1:i + 6]:
+            sp = _sin_acentos_mismo_largo(sig).upper().strip()
+            if re.match(r"^\W*(DOMICILIO|DOMICIL|CLAVE|CURP|FECHA|SEXO)", sp):
+                break
+            toks = []
+            for tk in re.findall(r"\S+", sig):
+                tk_p = _sin_acentos_mismo_largo(tk)
+                if re.fullmatch(r"[A-ZÑ]{2,}", tk_p) and tk.upper() == tk:
+                    toks.append(tk_p)
+                else:
+                    break
+            if toks:
+                piezas.append(" ".join(toks))
+            if len(piezas) == 3:
+                break
+        if len(piezas) == 3:
+            salida.append((piezas[2], piezas[0], piezas[1]))
+        elif len(piezas) == 2:
+            salida.append((piezas[1], piezas[0], None))
+    return salida
+
+
+def _ajusta_a_referencia(tok, referencia):
+    """Si 'tok' no está en 'referencia' pero es casi igual a una palabra de
+    ella (una letra de más/menos/cambiada), regresa esa palabra."""
+    if tok in referencia or len(tok) < 3:
+        return tok
+    mejor, mejor_r = tok, 0.0
+    for ref in referencia:
+        if abs(len(ref) - len(tok)) > 2:
+            continue
+        r = difflib.SequenceMatcher(None, tok, ref).ratio()
+        if r > mejor_r:
+            mejor, mejor_r = ref, r
+    return mejor if mejor_r >= 0.8 else tok
+
+
+def resolver_nombre_candidato(nombre_capturado, fuentes):
+    """Elige (nombres, apellido_paterno, apellido_materno, fuente) para la hoja
+    "Datos completos". 'fuentes' es una lista de (origen, (nombres, paterno,
+    materno)) en orden de preferencia (CSF, NSS, INE). Cada lectura se corrige
+    con el nombre capturado y se elige la que más palabras comparte con él;
+    sin nombre capturado, gana la que coincide con otra fuente. None si
+    ninguna lectura es creíble."""
+    referencia = set(_tokens_nombre(nombre_capturado))
+    candidatas = []
+    for orden, (origen, tri) in enumerate(fuentes):
+        if not tri or not tri[0] or not tri[1]:
+            continue
+        piezas = []
+        for campo in tri:
+            toks = _tokens_nombre(campo) if campo else []
+            piezas.append(toks)
+        todas = [t for pz in piezas for t in pz]
+        if len(todas) < 2 or len(todas) > 8:
+            continue
+        candidatas.append((orden, origen, piezas))
+    if not candidatas:
+        return None
+    if not referencia:
+        # sin nombre capturado: se vota entre las fuentes
+        conteo = {}
+        for _, _, piezas in candidatas:
+            for t in {t for pz in piezas for t in pz}:
+                conteo[t] = conteo.get(t, 0) + 1
+        referencia = {t for t, c in conteo.items() if c >= 2} or {t for _, _, pz in candidatas[:1] for p in pz for t in p}
+    mejor = None
+    for orden, origen, piezas in candidatas:
+        ajustadas = [[_ajusta_a_referencia(t, referencia) for t in pz] for pz in piezas]
+        # fichas sobrantes al final de un campo que no son del nombre (resto de OCR)
+        todas = [t for pz in ajustadas for t in pz]
+        aciertos = sum(1 for t in todas if t in referencia)
+        if aciertos == 0:
+            continue
+        if aciertos < len(todas):
+            for pz in ajustadas:
+                while pz and pz[-1] not in referencia and len(pz) > 1:
+                    pz.pop()
+            todas = [t for pz in ajustadas for t in pz]
+            aciertos = sum(1 for t in todas if t in referencia)
+        puntaje = aciertos / max(1, len(todas))
+        cobertura = aciertos / max(1, len(referencia))
+        llave = (round(puntaje * 0.6 + cobertura * 0.4, 3), -orden)
+        if puntaje >= 0.75 and (mejor is None or llave > mejor[0]):
+            mejor = (llave, origen, ajustadas)
+    if not mejor:
+        return None
+    _, origen, aj = mejor
+    return {
+        "nombres": " ".join(aj[0]) or None,
+        "apellido_paterno": " ".join(aj[1]) or None,
+        "apellido_materno": " ".join(aj[2]) or None,
+        "fuente": origen,
+    }
+
+
 # Número de crédito (Infonavit y Fonacot): etiqueta "Número de crédito"
 # seguida de una secuencia de dígitos. En Infonavit aparece limpio bajo el
 # apartado "Información del crédito del trabajador"; en Fonacot el
@@ -1573,12 +1862,19 @@ def busca_fecha_nacimiento(texto):
     Regresa un date o None si no se encontró la etiqueta o no había una
     fecha legible cerca."""
     t_norm = normaliza(texto)
-    for etiqueta in ("FECHA DE NACIMIENTO", "FECHADENACIMIENTO"):
-        idx = t_norm.find(etiqueta)
-        if idx == -1:
-            continue
-        ventana = t_norm[idx: idx + len(etiqueta) + 40]
+    # el OCR lee mal la etiqueta ("PECHA-DE NACIMIENTO:") y hay actas con
+    # puntuación de relleno entre las palabras
+    for m_etq in re.finditer(r"[FP]ECHA\W{0,3}(?:DE\W{0,3})?NACIMIENTO", t_norm):
+        ventana = t_norm[m_etq.start(): m_etq.end() + 40]
         candidatas = [f for f in busca_fechas(ventana) if f[0] <= HOY and f[0].year >= 1900]
+        if candidatas:
+            return candidatas[0][0]
+    # Actas con formato nuevo (impresas de registro civil en línea) ponen los
+    # VALORES arriba y las etiquetas abajo: "HOMBRE 03/12/1987 QUERETARO" /
+    # "Sexo Fecha de Nacimiento Lugar de Nacimiento".
+    m_val = re.search(r"\b(?:HOMBRE|MUJER)\s+(\d{1,2}\s*/\s*\d{1,2}\s*/\s*\d{4})", t_norm)
+    if m_val:
+        candidatas = [f for f in busca_fechas(m_val.group(1)) if f[0] <= HOY and f[0].year >= 1900]
         if candidatas:
             return candidatas[0][0]
     return None
@@ -1706,13 +2002,194 @@ def extraer_direccion_recibo_cfe(texto):
     direccion = ", ".join(previas + [ultimo])
     if not re.search(r"C\.?\s*P\.?\s*:?\s*\d{5}", direccion, flags=re.IGNORECASE):
         return None
+    direccion = re.sub(r"(?<=[A-Za-zÁÉÍÓÚÑ])(C\.?\s*P\.?)\s*(\d{5})", r" C.P. \2", direccion)  # "REFUGIOC.P.76269"
+    direccion = re.sub(r",(?=\S)", ", ", direccion)  # "QUERETARO,QRO"
     return direccion
 
 
+def extraer_direccion_recibo_telmex(texto):
+    """Estado de cuenta de Telmex: el domicilio NO lleva etiqueta; va debajo
+    del RFC del emisor, después del titular (y de "PUBLICO EN GENERAL" si el
+    recibo no está a nombre de quien lo paga), y termina en la línea del C.P.:
+
+        RFC: TME840315-KT6 21-MAY-2026
+        MELO PEREZ MIGUEL ANGEL
+        PUBLICO EN GENERAL
+        SIMON BOLIVAR COND COTABAMBAS
+        MZ 43 LT 32 CASA 9 A
+        FRACC LAS AMERICAS
+        ECATEPEC DE MORELOS, , EM
+        C.P. 55076-CR -55031
+
+    Regresa "calle, colonia, municipio, estado C.P. nnnnn" o None."""
+    if not texto:
+        return None
+    plano = _sin_acentos_mismo_largo(texto).upper()
+    if "TELEFONOS DE MEXICO" not in plano and "TELMEX" not in plano:
+        return None
+    lineas = [re.sub(r"\s+", " ", l).strip() for l in texto.split("\n")]
+    lineas_plano = [re.sub(r"\s+", " ", l).strip() for l in plano.split("\n")]
+    idx_rfc = next((i for i, l in enumerate(lineas_plano) if re.search(r"RFC\s*:?\s*TME\d{6}", l)), None)
+    if idx_rfc is None:
+        return None
+    idx_cp = None
+    for i in range(idx_rfc + 1, min(len(lineas), idx_rfc + 14)):
+        m = re.match(r"^C\.?\s*P\.?\s*:?\s*(\d{5})\b", lineas_plano[i])
+        if m and m.group(1) != "06500":
+            idx_cp = i
+            break
+    if idx_cp is None:
+        return None
+    bloque = []
+    for i in range(idx_rfc + 1, idx_cp):
+        l = lineas[i]
+        if re.search(r"RFC|FACTURA|TOTAL A PAGAR|PAGAR ANTES|MES DE FACTURACION", lineas_plano[i]):
+            continue
+        # la columna de la derecha ("Tu estado de cuenta puede ser pagado en
+        # cualquier centro de cobro indicado al reverso de este recibo") se
+        # cuela en los mismos renglones que el domicilio
+        l = re.sub(r"\s*(?:Tu\s+estado\s+de\s+cuenta\s+puede\s+ser|pagado\s+en\s+cualquier\s+centro\s+de\s+cobro|"
+                   r"indicado\s+al\s+reverso\s+de\s+este\s+recibo)\.?\s*", " ", l, flags=re.IGNORECASE)
+        l = re.sub(r"\s*[,.]\s*[,.]\s*", ", ", l).strip(" ,.")
+        if l:
+            bloque.append(l)
+    # se descartan el titular y "PUBLICO EN GENERAL": la dirección empieza
+    # después de esa leyenda o, si no existe, después de la primera línea.
+    idx_pub = next((i for i, l in enumerate(bloque) if "PUBLICO EN GENERAL" in _sin_acentos_mismo_largo(l).upper()), None)
+    if idx_pub is not None:
+        bloque = bloque[idx_pub + 1:]
+    else:
+        bloque = bloque[1:]
+    if len(bloque) < 2:
+        return None
+    # una dirección sin ningún número (ni de casa, ni manzana/lote) es una
+    # lectura incompleta del OCR: mejor reportar "no detectado" y reforzar
+    if not re.search(r"\d", " ".join(bloque)):
+        return None
+    cp = re.match(r"^C\.?\s*P\.?\s*:?\s*(\d{5})", lineas_plano[idx_cp]).group(1)
+    # "MZ 43 LT 32 CASA 9 A" va pegada a la calle en la misma "línea" lógica
+    calle = bloque[0]
+    resto = bloque[1:]
+    while resto and re.match(r"^(MZ|MANZANA|LT|LOTE|CASA|DEPTO?|NUM|NO)\b", _sin_acentos_mismo_largo(resto[0]).upper()):
+        calle += " " + resto.pop(0)
+    direccion = ", ".join([calle] + resto) + f" C.P. {cp}"
+    # Telmex abrevia el Estado de México como "EM"
+    return re.sub(r",\s*EM\s+C\.P\.", ", ESTADO DE MEXICO C.P.", direccion)
+
+
+def extraer_direccion_recibo_agua_cea(texto):
+    """Recibo de agua de la CEA Querétaro (CFDI): al extraer el texto de la
+    página, las columnas salen entrelazadas con los sellos digitales, pero el
+    domicilio del usuario siempre aparece así:
+
+        MA. NATIVIDAD RAMIREZ 99
+        RIO BLANCO 120,COLONIA f5928ee9-678e-4955-b45b-     <- UUID pegado
+        d7ef145c4d96
+        MENCHACA I 00001000000719236327
+        76140, SANTIAGO DE QUERÉTARO 07-jul-2026 a 07-ago-2026 ...
+        QUERÉTARO, QUERÉTARO
+
+    Regresa "calle núm, colonia, municipio, estado C.P. nnnnn" o None."""
+    if not texto:
+        return None
+    plano = _sin_acentos_mismo_largo(texto).upper()
+    if not re.search(r"AGUAS|CEAQUERETARO|AGUA POTABLE|CEA-?800313", plano):
+        return None
+    lineas = [re.sub(r"\s+", " ", l).strip() for l in texto.split("\n")]
+    for i, l in enumerate(lineas):
+        m = re.match(r"^([A-ZÁÉÍÓÚÑa-záéíóúñ0-9 .'\-/#]+?\d+[A-Za-z]?)\s*,\s*COLONIA\b\s*(.*)$", l, flags=re.IGNORECASE)
+        if not m:
+            continue
+        calle = m.group(1).strip()
+        sobrante = m.group(2)
+        colonia = None
+        ventana = [sobrante] + lineas[i + 1:i + 4]
+        for fragmento in ventana:
+            fragmento = re.sub(r"[0-9a-f]{4,}(?:-[0-9a-f]{3,}){1,}-?", " ", fragmento)  # UUID
+            fragmento = re.sub(r"\b[0-9a-f]{10,}\b", " ", fragmento)
+            pal = []
+            for tok in fragmento.split():
+                if re.fullmatch(r"[A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ.\-]{1,}", tok):
+                    pal.append(tok)
+                else:
+                    break
+            if pal:
+                colonia = " ".join(pal)
+                break
+        cp = muni = estado = None
+        for j in range(i + 1, min(len(lineas), i + 8)):
+            m2 = re.match(r"^(\d{5})\s*,\s*([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ .]+?)(?=\s+\d{2}-[a-z]{3}-\d{4}|\s+\d|$)", lineas[j], flags=re.IGNORECASE)
+            if m2:
+                cp, muni = m2.group(1), m2.group(2).strip()
+                for k in range(j + 1, min(len(lineas), j + 3)):
+                    m3 = re.match(r"^([A-ZÁÉÍÓÚÑ ]+?)\s*,\s*([A-ZÁÉÍÓÚÑ ]+?)\s*(?:\(M[ÉE]XICO\).*)?$", lineas[k], flags=re.IGNORECASE)
+                    if m3:
+                        estado = m3.group(2).strip()
+                        break
+                break
+        if cp and muni:
+            piezas = [calle] + ([f"COL. {colonia}"] if colonia else []) + [muni] + ([estado] if estado else [])
+            return ", ".join(piezas) + f" C.P. {cp}"
+    return None
+
+
+_CP_EMISORES_CONOCIDOS = {
+    "06600", "06500", "06300", "76010", "06010", "11560", "03100", "06600", "01210", "06700", "11000",
+}
+
+
+def extraer_direccion_por_cp(texto):
+    """Último recurso para un comprobante sin etiqueta de domicilio ni formato
+    conocido: busca una línea con "C.P. nnnnn" (que no sea el CP del emisor:
+    SAT, CFE, Telmex...) cuya vecindad traiga un estado de la República, y arma
+    la dirección con las líneas de arriba (hasta 3) que parecen dirección
+    (letras y/o números, sin símbolos ni frases largas). Siempre es una
+    propuesta a confirmar."""
+    if not texto:
+        return None
+    lineas = [re.sub(r"\s+", " ", l).strip() for l in texto.split("\n")]
+    for i, l in enumerate(lineas):
+        m = re.search(r"(?<![A-Za-z0-9])C\.?\s*P\.?\s*:?\s*(\d{5})(?!\d)", l, flags=re.IGNORECASE)
+        if not m or m.group(1) in _CP_EMISORES_CONOCIDOS:
+            continue
+        resto_linea = (l[:m.start()] + " " + l[m.end():]).strip(" ,.-")
+        piezas_arriba = []
+        for j in range(i - 1, max(-1, i - 4), -1):
+            a = lineas[j]
+            if not a or len(a) > 60 or re.search(r"[|<>~=@$%]|WWW|HTTP|TOTAL|PAGAR|FECHA|RFC|FOLIO|SERVICIO|NOMBRE", a.upper()):
+                break
+            piezas_arriba.insert(0, a.strip(" ,"))
+        siguiente = lineas[i + 1] if i + 1 < len(lineas) else ""
+        zona = " ".join([resto_linea, siguiente] + piezas_arriba[-1:])
+        tiene_estado = any(_es_estado_mexico(normaliza(tk)) for tk in re.split(r"[,\s]+", zona) if tk) or \
+            any(_es_estado_mexico(normaliza(x)) for x in (resto_linea, siguiente))
+        if not tiene_estado or not piezas_arriba:
+            continue
+        piezas = piezas_arriba + ([resto_linea] if resto_linea else [])
+        if siguiente and len(siguiente) <= 40 and any(
+                _es_estado_mexico(normaliza(tk)) for tk in re.split(r"[,\s]+", siguiente) if tk):
+            piezas.append(siguiente.strip(" ,."))
+        # la primera línea suele ser el nombre del titular: se descarta si la
+        # siguiente es la que trae el número de la calle
+        if len(piezas) >= 3 and not re.search(r"\d", piezas[0]) and re.search(r"\d", piezas[1]):
+            piezas = piezas[1:]
+        return ", ".join(piezas) + f" C.P. {m.group(1)}"
+    return None
+
+
 def _direccion_comprobante(texto):
+    # En un estado de cuenta de Telmex no hay etiqueta de domicilio ("AL
+    # DOMICILIAR TU RECIBO..." haría que el extractor genérico agarre
+    # publicidad): si el extractor propio no lo logra, se reporta vacío.
+    plano_t = _sin_acentos_mismo_largo(texto or "").upper()
+    if "TELEFONOS DE MEXICO" in plano_t and "ELECTRICIDAD" not in plano_t:
+        return extraer_domicilio_etiquetado(texto) or extraer_direccion_recibo_telmex(texto)
     return (extraer_domicilio_etiquetado(texto)
             or extraer_direccion_recibo_cfe(texto)
-            or extraer_direccion(texto, _ETIQUETAS_DOMICILIO_COMPROBANTE))
+            or extraer_direccion_recibo_telmex(texto)
+            or extraer_direccion_recibo_agua_cea(texto)
+            or extraer_direccion(texto, _ETIQUETAS_DOMICILIO_COMPROBANTE)
+            or extraer_direccion_por_cp(texto))
 
 
 def extraer_domicilio_etiquetado(texto):
@@ -1755,8 +2232,67 @@ def _normaliza_etiqueta_domicilio(texto):
     return re.sub(r"(?<![A-Za-z])DOM[ILU1]?C[ILU1]{1,3}O(?![A-Za-z])", "DOMICILIO", texto or "", flags=re.IGNORECASE)
 
 
+def _limpia_cola_direccion(direccion):
+    """Quita restos de OCR al final de una dirección del INE: letras sueltas
+    pegadas al C.P. ("76148É EA") o después del estado ("QUERETARO, QRO. MS")."""
+    if not direccion:
+        return direccion
+    d = re.sub(r"(\d{5})[^\d\s,]{1,2}(?:\s+[A-Za-zÉ]{1,3})?(?=,|$)", r"\1", direccion)
+    d = re.sub(r"\s+[=—~]+\.?(?:\s+\w)?(?=,|$)", "", d)  # "405 ==. 4" -> "405"
+    piezas = [p.strip() for p in d.split(",")]
+    limpias = []
+    for k, pz in enumerate(piezas):
+        fichas = pz.split()
+        # "y MIGUEL HIDALGO": minúscula suelta al inicio del pedazo
+        while len(fichas) > 1 and re.fullmatch(r"[a-zé]", fichas[0]):
+            fichas.pop(0)
+        # todo lo que va DESPUÉS del estado en el último pedazo es ruido
+        # ("CDMX Eon", "QRO. MS")
+        if k == len(piezas) - 1:
+            for pos, tk in enumerate(fichas):
+                if pos > 0 or len(fichas) > 1:
+                    if _es_estado_mexico(normaliza(tk)) and pos < len(fichas) - 1:
+                        fichas = fichas[:pos + 1]
+                        break
+        # fichas sueltas de 1-2 letras al final de cada pedazo ("... DEP 9A Me",
+        # "LAS AMERICAS 55076 e") son restos de OCR
+        while len(fichas) > 1 and re.fullmatch(r"[A-Za-zÉé]{1,2}\.?", fichas[-1]):
+            f = fichas[-1].strip(".")
+            if f.upper() in ("DE", "LA", "EL", "Y", "A") or _es_estado_mexico(normaliza(f)):
+                break
+            # minúscula suelta ("Me", "e"), una letra acentuada sola ("É") o dos
+            # mayúsculas que no son abreviatura: ruido
+            if any(c.islower() for c in f) or len(f) == 2 or (len(f) == 1 and not f.isascii()):
+                fichas.pop()
+            else:
+                break
+        pz = " ".join(fichas)
+        # un pedazo que es solo 1-3 letras y no es estado ("Es", "EN") es basura
+        if k < len(piezas) and re.fullmatch(r"[A-Za-zÉé]{1,3}\.?", pz) and not _es_estado_mexico(normaliza(pz)):
+            continue
+        limpias.append(pz)
+    return ", ".join(p for p in limpias if p)
+
+
 def _direccion_ine(texto):
-    return extraer_direccion(_normaliza_etiqueta_domicilio(texto), ["DOMICILIO"])
+    """Domicilio de la cara frontal del INE. El OCR reforzado puede repetir el
+    bloque (lectura de la tarjeta completa + de la columna de texto) y la
+    primera copia suele traer basura pegada ("y: DN, 3 + 7% C DEL BIOMBO"): se
+    prueba CADA aparición de la etiqueta y se queda con la que mejor puntúa
+    como dirección (ver _puntaje_direccion)."""
+    t = _normaliza_etiqueta_domicilio(texto)
+    plano = _sin_acentos_mismo_largo(t)
+    mejores = []
+    for m in re.finditer("DOMICILIO", plano):
+        d = extraer_direccion(t[m.start():], ["DOMICILIO"])
+        if not d:
+            continue
+        d = _limpia_cola_direccion(d)
+        ruido = len(re.findall(r"(?<![A-Za-z0-9])[A-Za-z0-9]{1,2}(?![A-Za-z0-9])", d))
+        mejores.append((_puntaje_direccion(d), -ruido, -len(mejores), d))
+    if not mejores:
+        return None
+    return max(mejores)[3]
 
 
 def _puntaje_direccion(direccion):
@@ -1792,12 +2328,40 @@ def _campos_clave_ine(texto):
     return int(domicilio_ok) + int(vigencia_ok), 2
 
 
+_FICHAS_CORTAS_VALIDAS = {
+    "DE", "LA", "EL", "Y", "A", "AV", "C", "CP", "MZ", "LT", "NO", "SN", "S/N", "DEL", "LOS", "LAS", "EN",
+    "SM", "MZA", "EM", "DF", "NL", "BC", "II", "III", "IV", "VI", "VII", "IX", "XI", "PB", "INT", "EXT",
+}
+
+
+def _ruido_direccion(direccion):
+    """Cuántas fichas de una dirección se ven como basura de OCR (símbolos
+    raros como "€" o letras sueltas que no son preposición/abreviatura
+    conocida): 0 = se ve limpia. Sirve para decidir si conviene reforzar la
+    lectura aunque ya salió "algo"."""
+    ruido = 0
+    for tk in re.findall(r"\S+", direccion or ""):
+        limpio = tk.strip(".,;:()")
+        if re.search(r"[€¢£$¥¿¡|~=<>{}\[\]\\^_*]", limpio):
+            ruido += 1
+        elif len(limpio) <= 2 and limpio and not limpio.isdigit() and limpio.upper() not in _FICHAS_CORTAS_VALIDAS \
+                and not re.fullmatch(r"\d+[A-Za-z]?", limpio):
+            ruido += 1
+    return ruido
+
+
+def _ruido_comprobante(texto):
+    """Ruido de la dirección que se extraería de 'texto' (99 si no hay)."""
+    d = _direccion_comprobante(texto)
+    return _ruido_direccion(d) if d else 99
+
+
 def _campos_clave_comprobante(texto):
     """(campos_ok, total) para el comprobante de domicilio: una fecha que
     permita calcular la vigencia y un domicilio."""
     _, _, fecha = analiza_comprobante_domicilio(texto)
     direccion = _direccion_comprobante(texto)
-    return int(fecha is not None) + int(bool(direccion)), 2
+    return int(fecha is not None) + int(bool(direccion) and _ruido_direccion(direccion) == 0), 2
 
 
 def _campos_clave_cuenta(texto):
@@ -1825,7 +2389,13 @@ def _campos_clave_csf(texto):
         and not re.search(r"[:]", d["entidad_federativa"])
         and len(d["entidad_federativa"]) <= 30
     )
-    return int(dir_ok) + int(bool(d["codigo_postal"])), 2
+    # El RFC y el nombre también salen del OCR reforzado (cada franja de la
+    # hoja aporta campos distintos): sin pedirlos, la lectura se detenía en
+    # cuanto el domicilio salía bien y la CSF se quedaba sin RFC.
+    rfc_ok = extraer_rfc(texto) is not None
+    ap = extraer_apellido_paterno_csf(texto)
+    nombre_ok = bool(ap and extraer_nombres_csf_bien_espaciado(texto, ap, extraer_apellido_materno_csf(texto)))
+    return int(dir_ok) + int(bool(d["codigo_postal"])) + int(rfc_ok) + int(nombre_ok), 4
 
 
 _ETIQUETAS_DOMICILIO_COMPROBANTE = [
@@ -1888,9 +2458,24 @@ def _refuerza_ocr_si_hace_falta(ruta, clave, paginas_texto, ocr_usado):
         else:
             alt = "\n".join(candidatos)
         if alt:
-            paginas[i] = alt + "\n" + original
-            ocr[i] = True
-            aplicado = True
+            nuevo = alt + "\n" + original
+            # Comprobante: la lectura reforzada solo se acepta si de veras deja
+            # el domicilio/fecha mejor que la primera lectura (más campos o,
+            # a igual cantidad, menos basura de OCR en la dirección); si no,
+            # se conserva el texto original tal cual.
+            if clave == "COMPROBANTE_DOMICILIO":
+                resto_p = [p_ for k_, p_ in enumerate(paginas) if k_ != i]
+                antes = "\n".join(paginas[:i] + [original] + paginas[i + 1:])
+                despues = "\n".join(paginas[:i] + [nuevo] + paginas[i + 1:])
+                ok_antes, ok_despues = chequeo(antes)[0], chequeo(despues)[0]
+                mejora = ok_despues > ok_antes or (
+                    ok_despues == ok_antes and _ruido_comprobante(despues) < _ruido_comprobante(antes))
+                if not mejora:
+                    nuevo = None
+            if nuevo is not None:
+                paginas[i] = nuevo
+                ocr[i] = True
+                aplicado = True
         if chequeo("\n".join(paginas))[0] >= total:
             break
     return paginas, ocr, aplicado
@@ -1917,7 +2502,7 @@ ESTADOS_MEXICO_ALIAS = {
     "GUERRERO", "GRO",
     "HIDALGO", "HGO",
     "JALISCO", "JAL",
-    "ESTADO DE MEXICO", "EDOMEX", "EDO MEX", "EDO DE MEXICO", "MEX",
+    "ESTADO DE MEXICO", "EDOMEX", "EDO MEX", "EDO DE MEXICO", "MEX", "EM",
     "MICHOACAN", "MICH", "MICHOACAN DE OCAMPO",
     "MORELOS", "MOR",
     "NAYARIT", "NAY",
@@ -2074,6 +2659,12 @@ def descomponer_direccion(direccion):
         if m_int:
             resultado["numero_interior"] = m_int.group(1)
             primero = primero[:m_int.start()].strip(" ,.-")
+        # "... MZ 43 LT 32 CASA 9 A" / "... DEP 9A": casa/departamento al
+        # final del renglón es el número interior
+        m_casa = re.search(r"\s+(?:CASA|DEPTO?|DPTO|DEP|LOCAL)\.?\s*([A-Za-z0-9\-]+(?:\s+[A-Za-z])?)$", primero, flags=re.IGNORECASE)
+        if m_casa and resultado["numero_interior"] is None:
+            resultado["numero_interior"] = m_casa.group(1)
+            primero = primero[:m_casa.start()].strip(" ,.-")
         # "DOROTEA MZ 17 LT 12": manzana y lote juntos son el número exterior
         m_mzlt = re.search(r"\s+((?:MZA?|MANZANA)\.?\s*\d+\s*(?:LT|LOTE)\.?\s*\d+)$", primero, flags=re.IGNORECASE)
         if m_mzlt:
@@ -2138,6 +2729,19 @@ def analiza_cuenta_bancaria(texto_completo, nombre_candidato):
             if _clabe_valida(m.group(1)) and m.group(1)[:3] in CODIGOS_CLABE_BANCOS:
                 clabe = m.group(1)
                 break
+        else:
+            # algunos estados de cuenta imprimen la CLABE en grupos
+            # ("012 180 01531397537 2"): se busca renglón por renglón una
+            # racha de 18 dígitos con espacios sueltos entre ellos y se
+            # acepta solo si el dígito verificador y el banco cuadran.
+            for linea in t_norm.split("\n"):
+                for m in re.finditer(r"(?<![\d])\d(?:[ ]?\d){16}[ ]?\d(?![\d])", linea):
+                    cand = re.sub(r"\s", "", m.group(0))
+                    if _clabe_valida(cand) and cand[:3] in CODIGOS_CLABE_BANCOS:
+                        clabe = cand
+                        break
+                if clabe and _clabe_valida(clabe):
+                    break
 
     banco = None
     if clabe:
@@ -2149,6 +2753,10 @@ def analiza_cuenta_bancaria(texto_completo, nombre_candidato):
     if numero_cuenta is None and clabe and _clabe_valida(clabe):
         # en una CLABE, los dígitos 7 a 17 son el número de cuenta (11 dígitos)
         numero_cuenta = clabe[6:17]
+        # BBVA (012) y Banorte (072) numeran sus cuentas con 10 dígitos: el
+        # primer dígito de ese bloque de 11 de la CLABE es un cero de relleno.
+        if clabe[:3] in ("012", "072") and numero_cuenta.startswith("0"):
+            numero_cuenta = numero_cuenta[1:]
         cuenta_derivada = True
     tiene_cuenta = numero_cuenta is not None
     nombre_ok, proporcion = nombre_coincide(texto_completo, nombre_candidato)
@@ -2173,7 +2781,7 @@ def analiza_cuenta_bancaria(texto_completo, nombre_candidato):
     if not clabe:
         obs.append("No se encontró una CLABE de 18 dígitos legible.")
     if cuenta_derivada:
-        obs.append(f"Número de cuenta tomado de la CLABE (dígitos 7 a 17): {numero_cuenta}.")
+        obs.append(f"Número de cuenta tomado de la CLABE: {numero_cuenta}.")
     elif not tiene_cuenta:
         obs.append("No se encontró un número de cuenta explícito.")
     obs.append("El logo del banco no puede confirmarse por OCR: revisar visualmente el PDF.")
@@ -2404,10 +3012,17 @@ def _busca_vigencia_ine(texto_norm):
     hay ninguna. Se prueban TODAS las apariciones (no solo la primera): con
     varias lecturas de OCR concatenadas, una puede traer la palabra sin los
     años y otra con ellos."""
-    for m in re.finditer("VIGENCIA", texto_norm):
+    for m in re.finditer(r"VI[GC]E[NM]C[IL1]A", texto_norm):  # el OCR lee "VICENCIA"
         anios = re.findall(r"\b(19\d{2}|20\d{2})\b", texto_norm[m.start(): m.start() + 80])
         if len(anios) >= 2:
             return int(anios[-2]), int(anios[-1])
+    # credenciales nuevas: "EMISION 2017 VIGENCIA 2027" (un solo año después
+    # de la etiqueta; el de emisión va ANTES de ella)
+    for m in re.finditer(r"VI[GC]E[NM]C[IL1]A", texto_norm):
+        despues = re.findall(r"\b(19\d{2}|20\d{2})\b", texto_norm[m.end(): m.end() + 30])
+        antes = re.findall(r"EMISION\s*(19\d{2}|20\d{2})\b", texto_norm[max(0, m.start() - 30): m.start()])
+        if despues and antes:
+            return int(antes[-1]), int(despues[0])
     return None
 
 
@@ -2459,7 +3074,7 @@ def analiza_ine(paginas_texto, ruta=None):
             obs.append(f"Vigencia impresa en la cara frontal: {anio_inicio}-{anio_fin} (vigente hoy {HOY.isoformat()}){sufijo}.")
         else:
             obs.append(f"Vigencia impresa en la cara frontal: {anio_inicio}-{anio_fin} — VENCIDA (venció hace {abs(dias_para_vencer)} días respecto a hoy {HOY.isoformat()}){sufijo}.")
-    elif t_norm.find("VIGENCIA") != -1:
+    elif re.search(r"VI[GC]E[NM]C[IL1]A", t_norm):
         obs.append("Se encontró la palabra VIGENCIA en la cara frontal pero no dos años legibles junto a ella; revisar manualmente.")
     else:
         obs.append("No se detectó el campo de vigencia en la cara frontal; revisar manualmente.")
@@ -2565,7 +3180,22 @@ def analiza_comprobante_domicilio(texto_completo):
 # Procesamiento principal
 # ---------------------------------------------------------------------------
 
+# Máximo de documentos que pueden estar en OCR al mismo tiempo en este
+# proceso (el servidor atiende varias cargas a la vez, ver Dockerfile). Más
+# que las CPU disponibles solo vuelve todo más lento y provoca timeouts de
+# Tesseract; el resto espera su turno (la conexión se mantiene viva con los
+# latidos del stream).
+_SEM_DOCUMENTOS = threading.BoundedSemaphore(max(1, int(os.environ.get("OCR_CONCURRENTES", "2"))))
+
+
 def procesar_documento(ruta, nombre_candidato, categoria_forzada=None):
+    """Procesa un documento (ver _procesar_documento) esperando su turno si ya
+    hay OCR_CONCURRENTES documentos en proceso."""
+    with _SEM_DOCUMENTOS:
+        return _procesar_documento(ruta, nombre_candidato, categoria_forzada=categoria_forzada)
+
+
+def _procesar_documento(ruta, nombre_candidato, categoria_forzada=None):
     """Si se da categoria_forzada (clave de CATEGORIAS), se usa esa
     categoría directamente en vez de intentar reconocerla por contenido —
     esto es lo que usa la carga masiva por ZIP, donde la categoría ya viene
@@ -2650,6 +3280,7 @@ def procesar_documento(ruta, nombre_candidato, categoria_forzada=None):
     elif clave == "NSS":
         nss = extraer_nss(texto_completo)
         fila["numero_seguridad_social"] = nss
+        fila["nombres_nss"] = extraer_nombres_nss(texto_completo)
         if nss:
             detalles_extra.append(f"Número de Seguridad Social detectado: {nss}.")
         else:
@@ -2698,6 +3329,7 @@ def procesar_documento(ruta, nombre_candidato, categoria_forzada=None):
         # la fecha de hoy; que el PDF traiga ambas caras solo se checa por
         # separado (num_paginas_ok) para no mezclar los dos criterios.
         r = analiza_ine(paginas_texto, ruta=ruta)
+        fila["nombres_ine"] = extraer_nombres_ine(texto_completo)
         fila["vigencia_ok"] = r["vigente"]
         fila["vigencia_fecha_texto"] = f"Vigente hasta {r['vigencia_anio_fin']}" if r["vigencia_anio_fin"] else None
         fila["num_paginas_ok"] = r["dos_paginas"]
@@ -3286,7 +3918,18 @@ def _valores_datos_completos(candidato, filas):
     # reconocimiento (siempre una propuesta a confirmar).
     domicilio_ine = (ine_fila or {}).get("domicilio") or {}
     domicilio_comprobante = (domicilio_fila or {}).get("domicilio") or {}
-    domicilio_particular = domicilio_ine if any(domicilio_ine.values()) else domicilio_comprobante
+    # La plantilla de alta indica que Calle/Número/Colonia/Municipio/Estado/CP
+    # "se obtienen del comprobante de domicilio": se prefiere ese documento
+    # cuando su dirección salió razonablemente completa (calle, municipio y
+    # CP) y se cae al INE solo si no se recibió o no se pudo leer.
+    comprobante_ok = bool(domicilio_comprobante.get("calle") and domicilio_comprobante.get("codigo_postal")
+                          and (domicilio_comprobante.get("municipio") or domicilio_comprobante.get("colonia")))
+    if comprobante_ok:
+        domicilio_particular = domicilio_comprobante
+    elif any(domicilio_ine.values()):
+        domicilio_particular = domicilio_ine
+    else:
+        domicilio_particular = domicilio_comprobante
     nacionalidad_manual = candidato.get("nacionalidad")
 
     # Nombre(s)/Apellidos: se prefieren los que trae la CSF (documento
@@ -3299,6 +3942,16 @@ def _valores_datos_completos(candidato, filas):
     nombres_csf = (csf_fila or {}).get("nombres")
     apellido_paterno_csf = (csf_fila or {}).get("apellido_paterno")
     apellido_materno_csf = (csf_fila or {}).get("apellido_materno")
+    fuentes_nombre = [("CSF", (nombres_csf, apellido_paterno_csf, apellido_materno_csf))]
+    if (nss_fila or {}).get("nombres_nss"):
+        fuentes_nombre.append(("NSS", nss_fila["nombres_nss"]))
+    for tri in (ine_fila or {}).get("nombres_ine") or []:
+        fuentes_nombre.append(("INE", tri))
+    resuelto = resolver_nombre_candidato(candidato.get("nombre"), fuentes_nombre)
+    if resuelto:
+        nombres_csf = resuelto["nombres"]
+        apellido_paterno_csf = resuelto["apellido_paterno"]
+        apellido_materno_csf = resuelto["apellido_materno"]
     if nombres_csf and apellido_paterno_csf:
         nombre_worky = " ".join(p for p in (nombres_csf, apellido_paterno_csf, apellido_materno_csf) if p)
         nombre_worky_es_propuesta = True
