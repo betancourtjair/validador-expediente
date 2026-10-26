@@ -31,7 +31,7 @@ propia página, no pestañas de JavaScript, para mantenerlo simple):
                originales-, más los Excel consolidados de /lote (catalogados
                como "Candidatos varios"). Solo para el equipo de
                reclutamiento -pide usuario y contraseña-. Los archivos se
-               eliminan automáticamente a los 7 días.
+               eliminan automáticamente a los 30 días.
 
 Cómo correrlo
 --------------
@@ -170,7 +170,7 @@ CAMPOS_DOCUMENTOS = [
 # reiniciar la única que haya) y el disco local NO se comparte entre ellas;
 # si se guardara solo en disco, la página de Documentos a veces "no
 # encontraría" un archivo que sí se generó, según qué instancia atendiera
-# cada petición. El borrado automático a los 7 días se configura como una
+# cada petición. El borrado automático a los 30 días se configura como una
 # regla de "lifecycle" del propio bucket (más confiable que borrarlo desde
 # el código: funciona aunque nadie visite la página en varios días).
 #
@@ -711,7 +711,7 @@ Excel con el resultado.</p>
   <strong>carga individual</strong> de los candidatos, además de los Excel
   consolidados de la <strong>carga masiva</strong> (catalogados como
   "Candidatos varios"). <strong>Requiere iniciar sesión.</strong></p>
-  <p>Los archivos se eliminan automáticamente 7 días después de haberse
+  <p>Los archivos se eliminan automáticamente 30 días después de haberse
   generado.</p>
   <a class="boton" href="/descargas">Ir a documentos</a>
 </div>
@@ -930,7 +930,7 @@ CONTENIDO_DESCARGAS = """
   ZIP, los documentos originales que subió ese candidato-, más los Excel
   consolidados de la <strong>carga masiva</strong> (catalogados como
   "Candidatos varios", con el nombre de quien subió la tanda). Se eliminan
-  automáticamente 7 días después de haberse generado.
+  automáticamente 30 días después de haberse generado.
 </div>
 <table class="descargas">
   <thead><tr><th>Candidato</th><th>Reclutador</th><th>Generado</th><th></th></tr></thead>
@@ -997,7 +997,7 @@ def descargas():
 def descargar_archivo(nombre_interno):
     datos = leer_expediente_individual(nombre_interno)
     if datos is None:
-        return "Archivo no encontrado (puede que ya se haya eliminado automáticamente después de 7 días).", 404
+        return "Archivo no encontrado (puede que ya se haya eliminado automáticamente después de 30 días).", 404
     if nombre_interno.endswith(".zip"):
         mimetype = "application/zip"
     else:
