@@ -147,7 +147,6 @@ def requiere_login(f):
 
 CAMPOS_DOCUMENTOS = [
     ("cv", "CV", True),
-    ("acta_nacimiento", "Acta de nacimiento", True),
     ("ine", "INE (ambos lados en 1 PDF)", True),
     ("comprobante_domicilio", "Comprobante de domicilio", True),
     ("comprobante_estudios", "Certificado de estudios", True),
@@ -1105,7 +1104,8 @@ def _generar_eventos_validacion(tmp, rutas, candidato, categoria_por_ruta=None):
                     "detalle": f"Error: {e}",
                 }
             print(f"[validar]   listo {nombre_doc} ({time.time() - t0:.1f}s)", file=sys.stderr, flush=True)
-            filas.append(fila)
+            if fila.get("categoria_clave") != ve.ACTA_IGNORADA:  # el acta ya no se pide ni se reporta
+                filas.append(fila)
             hecho += 1
             yield _evento_sse({"tipo": "progreso", "hecho": hecho, "total": total, "archivo_actual": nombre_doc})
 

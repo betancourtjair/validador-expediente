@@ -945,7 +945,10 @@ def _ocr_hd_forzado(ruta, indice_pagina=0, todas_las_variantes=False):
 # clave -> (nombre legible, lista de palabras/frases clave, es obligatorio)
 CATEGORIAS = {
     "CV": ("CV", ["EXPERIENCIA LABORAL", "REFERENCIAS LABORALES", "PERFIL PROFESIONAL", "CURRICULUM", "HABILIDADES", "FORMACION ACADEMICA", "ACERCA DE MI"], True),
-    "ACTA_NACIMIENTO": ("Acta de nacimiento", ["ACTA DE NACIMIENTO", "REGISTRO CIVIL", "OFICIALIA", "NACIMIENTOS"], True),
+    # El acta de nacimiento YA NO se pide ni se reporta. Se deja la categoría solo para
+    # reconocerla por contenido/nombre y descartarla (ver ACTA_IGNORADA), de modo que no
+    # se confunda con el CURP u otro documento si llega en un ZIP.
+    "ACTA_NACIMIENTO": ("Acta de nacimiento", ["ACTA DE NACIMIENTO", "REGISTRO CIVIL", "OFICIALIA", "NACIMIENTOS"], False),
     "INE": ("INE", ["INSTITUTO NACIONAL ELECTORAL", "CREDENCIAL PARA VOTAR", "CLAVE DE ELECTOR"], True),
     "COMPROBANTE_DOMICILIO": ("Comprobante de domicilio", ["COMISION FEDERAL DE ELECTRICIDAD", "CFE", "TELMEX", "RECIBO", "TOTAL A PAGAR", "PERIODO FACTURADO", "IZZI", "TELEFONOS DE MEXICO", "AGUA"], True),
     "COMPROBANTE_ESTUDIOS": ("Certificado de estudios", ["CERTIFICADO DE ESTUDIOS", "CURSO Y ACREDITO", "UNIVERSIDAD", "LICENCIATURA", "CEDULA PROFESIONAL", "SECRETARIA DE EDUCACION", "BACHILLERATO", "PROMEDIO GENERAL"], True),
@@ -963,13 +966,16 @@ CATEGORIAS = {
 
 # orden e integrantes de la checklist obligatoria que pidió el negocio
 CHECKLIST_OBLIGATORIO = [
-    "CV", "ACTA_NACIMIENTO", "INE", "COMPROBANTE_DOMICILIO",
+    "CV", "INE", "COMPROBANTE_DOMICILIO",
     "COMPROBANTE_ESTUDIOS", "CURP", "CSF", "NSS", "CUENTA_BANCARIA",
     "INFONAVIT", "FONACOT", "CERTIFICADO_MEDICO", "CERTIFICADO_INSTRUCTOR",
     "CONSTANCIA_LABORAL",
 ]
 
 # de estos, cuáles son condicionales (no siempre aplican) en vez de siempre-obligatorios
+# categorías que se reconocen pero NO se procesan ni se reportan (ya no son necesarias)
+ACTA_IGNORADA = "ACTA_NACIMIENTO"
+
 CONDICIONALES = {"INFONAVIT", "FONACOT", "CERTIFICADO_MEDICO", "CERTIFICADO_INSTRUCTOR", "CONSTANCIA_LABORAL"}
 
 
@@ -3368,23 +3374,6 @@ def _procesar_documento(ruta, nombre_candidato, categoria_forzada=None):
                 "Se recomienda pedir solo la carátula (1 página) para no exponer el detalle de movimientos."
             )
 
-    elif clave == "ACTA_NACIMIENTO":
-        dentro, obs, fecha = analiza_fecha_limite(texto_completo, 365 * 5, "el acta de nacimiento")
-        fila["vigencia_ok"] = dentro
-        fila["vigencia_fecha_texto"] = fecha.isoformat() if fecha else None
-        detalles_extra.append(obs + " (regla de 5 años detectada como práctica común; confirmar si aplica formalmente).")
-
-        fecha_nac = busca_fecha_nacimiento(texto_completo)
-        fila["fecha_nacimiento"] = fecha_nac
-        fila["fecha_nacimiento_texto"] = fecha_nac.strftime("%d/%m/%Y") if fecha_nac else None
-        if fecha_nac:
-            detalles_extra.append(f"Fecha de nacimiento detectada: {fecha_nac.strftime('%d/%m/%Y')}.")
-        else:
-            detalles_extra.append(
-                "No se detectó la fecha de nacimiento (etiqueta 'FECHA DE NACIMIENTO' no encontrada o sin "
-                "fecha legible cerca); revisar manualmente."
-            )
-
     fila["detalle"] += " ".join(detalles_extra)
     return fila
 
@@ -3441,6 +3430,8 @@ def procesar_zip_candidato_progresivo(ruta_zip, nombre_candidato, dir_extraccion
                 ruta_extraida = zf.extract(nombre_interno, dir_extraccion)
                 categoria = detectar_categoria_por_nombre_archivo(nombre_base)
                 fila = procesar_documento(ruta_extraida, nombre_candidato, categoria_forzada=categoria)
+                if fila.get("categoria_clave") == ACTA_IGNORADA:
+                    continue  # el acta de nacimiento ya no se pide: se descarta sin reportarla
             except Exception as e:
                 fila = {
                     "archivo": nombre_base, "categoria_clave": "ERROR",
@@ -3452,36 +3443,8 @@ def procesar_zip_candidato_progresivo(ruta_zip, nombre_candidato, dir_extraccion
     return filas
 
 
-def _concilia_fecha_nacimiento(filas):
-    """Valida la fecha de nacimiento leída del acta contra la que lleva
-    incrustada el CURP (AAMMDD). El OCR del acta confunde dígitos con
-    facilidad (2008 -> 2003) y esa fecha alimenta la edad y "Datos
-    completos", mientras que el CURP (documento o CSF) la trae de forma
-    estructurada. Si difieren, se usa la del CURP y se deja un aviso en las
-    observaciones del acta. Modifica 'filas' en sitio."""
-    acta = next((f for f in filas if f["categoria_clave"] == "ACTA_NACIMIENTO"), None)
-    if not acta or not acta.get("fecha_nacimiento"):
-        return
-    curp_fila = next((f for f in filas if f["categoria_clave"] == "CURP" and f.get("curp")), None)
-    csf_fila = next((f for f in filas if f["categoria_clave"] == "CSF" and f.get("curp")), None)
-    curp = (curp_fila or {}).get("curp") or (csf_fila or {}).get("curp")
-    if not curp:
-        return
-    derivada = datos_derivados_de_curp(curp).get("fecha_nacimiento")
-    if not derivada or derivada == acta["fecha_nacimiento"]:
-        return
-    leida = acta.get("fecha_nacimiento_texto")
-    acta["fecha_nacimiento"] = derivada
-    acta["fecha_nacimiento_texto"] = derivada.strftime("%d/%m/%Y")
-    acta["detalle"] = (acta.get("detalle") or "") + (
-        f" AVISO: la fecha de nacimiento leída del acta ({leida}) no coincide con la que trae el CURP "
-        f"({acta['fecha_nacimiento_texto']}); se usó la del CURP (el OCR del acta pudo confundir un dígito). "
-        "Revisar contra el PDF."
-    )
-
-
 def construir_reporte(candidato, filas):
-    _concilia_fecha_nacimiento(filas)
+    filas[:] = [f for f in filas if f.get("categoria_clave") != ACTA_IGNORADA]
     encontrados_por_categoria = {}
     for fila in filas:
         encontrados_por_categoria.setdefault(fila["categoria_clave"], []).append(fila)
@@ -3620,9 +3583,9 @@ def _llenar_hoja_resumen(ws, candidato, filas, checklist, extra, fila_inicio=1):
             r += 1
 
     # --- Vigencias verificadas (INE cara frontal, comprobante de domicilio,
-    # CSF, acta) contra la fecha de hoy. Se listan aunque no se haya podido
+    # CSF) contra la fecha de hoy. Se listan aunque no se haya podido
     # leer la fecha, para que quede visible qué falta revisar a mano. -------
-    DOCS_CON_REGLA_VIGENCIA = {"INE", "COMPROBANTE_DOMICILIO", "CSF", "ACTA_NACIMIENTO"}
+    DOCS_CON_REGLA_VIGENCIA = {"INE", "COMPROBANTE_DOMICILIO", "CSF"}
     con_vigencia = [f for f in filas if f["categoria_clave"] in DOCS_CON_REGLA_VIGENCIA]
     r += 2
     ws.cell(row=r, column=1, value=f"Vigencias verificadas contra hoy ({HOY.isoformat()}):").font = Font(bold=True)
@@ -3643,14 +3606,13 @@ def _llenar_hoja_resumen(ws, candidato, filas, checklist, extra, fila_inicio=1):
         r += 1
 
     # --- Datos extraídos de los documentos (RFC de la CSF, CURP del
-    # documento CURP, fecha de nacimiento del acta, dirección del
+    # documento CURP, fecha de nacimiento (derivada del CURP), dirección del
     # comprobante de domicilio y del INE por separado). Igual que los datos
     # bancarios de abajo, son "propuesta a confirmar": se muestran para que
     # el equipo de reclutamiento no tenga que abrir cada PDF, pero siguen
     # marcados como pendientes de revisar contra el documento original. ---
     csf_fila = next((f for f in filas if f["categoria_clave"] == "CSF"), None)
     curp_fila = next((f for f in filas if f["categoria_clave"] == "CURP"), None)
-    acta_fila = next((f for f in filas if f["categoria_clave"] == "ACTA_NACIMIENTO"), None)
     domicilio_fila = next((f for f in filas if f["categoria_clave"] == "COMPROBANTE_DOMICILIO"), None)
     ine_fila = next((f for f in filas if f["categoria_clave"] == "INE"), None)
     infonavit_fila = next((f for f in filas if f["categoria_clave"] == "INFONAVIT"), None)
@@ -3662,6 +3624,15 @@ def _llenar_hoja_resumen(ws, candidato, filas, checklist, extra, fila_inicio=1):
     r += 1
     _set_encabezados(ws, ["Dato", "Valor detectado", "Fuente"], fila=r)
     r += 1
+    def _fecha_nac_curp(curp_doc, csf_doc):
+        """Fecha de nacimiento (dd/mm/aaaa) derivada del CURP (documento o CSF);
+        (valor, sin_documento) igual que _dato()."""
+        curp_val = (curp_doc or {}).get("curp") or (csf_doc or {}).get("curp")
+        if not curp_val:
+            return None, curp_doc is None and csf_doc is None
+        fecha = datos_derivados_de_curp(curp_val).get("fecha_nacimiento")
+        return (fecha.strftime("%d/%m/%Y") if fecha else None), False
+
     def _dato(fila_doc, campo):
         """(valor, sin_documento) — distingue "no se recibió el documento
         fuente" (condicionales como Infonavit/Fonacot que pueden no aplicar)
@@ -3678,7 +3649,7 @@ def _llenar_hoja_resumen(ws, candidato, filas, checklist, extra, fila_inicio=1):
         ("Dirección fiscal (CSF)", *_dato(csf_fila, "direccion_fiscal"), "CSF"),
         ("NSS (Número de Seguridad Social)", *_dato(nss_fila, "numero_seguridad_social"), "Asignación de NSS (IMSS)"),
         ("Régimen (CSF, hoja 2)", *_dato(csf_fila, "regimen"), "CSF"),
-        ("Fecha de nacimiento", *_dato(acta_fila, "fecha_nacimiento_texto"), "Acta de nacimiento"),
+        ("Fecha de nacimiento", *_fecha_nac_curp(curp_fila, csf_fila), "CURP"),
         ("Dirección", *_dato(domicilio_fila, "direccion"), "Comprobante de domicilio"),
         ("Dirección (INE)", *_dato(ine_fila, "direccion"), "INE"),
         ("Número de crédito Infonavit", *_dato(infonavit_fila, "numero_credito"), "Infonavit"),
@@ -3882,7 +3853,6 @@ def _valores_datos_completos(candidato, filas):
     capturó tal cual en el formulario, que no necesita ese resaltado."""
     csf_fila = next((f for f in filas if f["categoria_clave"] == "CSF"), None)
     curp_fila = next((f for f in filas if f["categoria_clave"] == "CURP"), None)
-    acta_fila = next((f for f in filas if f["categoria_clave"] == "ACTA_NACIMIENTO"), None)
     domicilio_fila = next((f for f in filas if f["categoria_clave"] == "COMPROBANTE_DOMICILIO"), None)
     ine_fila = next((f for f in filas if f["categoria_clave"] == "INE"), None)
     infonavit_fila = next((f for f in filas if f["categoria_clave"] == "INFONAVIT"), None)
@@ -3893,17 +3863,12 @@ def _valores_datos_completos(candidato, filas):
     curp = (curp_fila or {}).get("curp") or (csf_fila or {}).get("curp")
     derivados = datos_derivados_de_curp(curp) if curp else {}
 
-    # Fecha de nacimiento: se prefiere la del acta de nacimiento (documento
-    # oficial, ya extraída con su propia etiqueta) y solo si no se recibió
-    # o no se pudo leer, se usa la que se deriva del CURP (AAMMDD + regla
-    # del diferenciador para el siglo, ver datos_derivados_de_curp). La
-    # edad se calcula igual en los dos casos, con una resta simple contra
-    # hoy.
-    fecha_nac = (acta_fila or {}).get("fecha_nacimiento")
-    fecha_nac_texto = (acta_fila or {}).get("fecha_nacimiento_texto")
-    if not fecha_nac and derivados.get("fecha_nacimiento"):
-        fecha_nac = derivados["fecha_nacimiento"]
-        fecha_nac_texto = fecha_nac.strftime("%d/%m/%Y")
+    # Fecha de nacimiento: se deriva del CURP (AAMMDD + regla del
+    # diferenciador para el siglo, ver datos_derivados_de_curp); ya no se
+    # pide acta de nacimiento. La edad se calcula con una resta simple
+    # contra hoy.
+    fecha_nac = derivados.get("fecha_nacimiento")
+    fecha_nac_texto = fecha_nac.strftime("%d/%m/%Y") if fecha_nac else None
     edad = None
     if fecha_nac:
         edad = HOY.year - fecha_nac.year - ((HOY.month, HOY.day) < (fecha_nac.month, fecha_nac.day))
