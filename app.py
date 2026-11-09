@@ -557,7 +557,41 @@ function configurarFormularioConProgreso(opciones) {
     barra.max = 1;
     barraTexto.textContent = "Subiendo archivos...";
 
-    var datos = new FormData(form);
+    // Antes de subir, cada archivo se copia a la memoria del navegador. En
+    // celulares (sobre todo Android), un archivo elegido desde Drive, WhatsApp,
+    // Descargas en la nube, etc. puede moverse, cambiar o no estar realmente
+    // descargado; en ese caso el navegador cancela la subida con un "Failed to
+    // fetch" aunque la red esté perfecta, y el reintento falla igual. Con la
+    // copia en memoria eso ya no puede pasar, y si un archivo no se puede leer
+    // se avisa cuál es (en vez de culpar a la conexión).
+    var datosOriginal = new FormData(form);
+    var entradas = [];
+    datosOriginal.forEach(function (v, k) { entradas.push([k, v]); });
+    var archivosIlegibles = [];
+    var copias = entradas.map(function (par) {
+      var v = par[1];
+      if (v && typeof v === "object" && v.size && typeof v.arrayBuffer === "function") {
+        return v.arrayBuffer().then(
+          function (buf) { return new Blob([buf], { type: v.type || "application/pdf" }); },
+          function () { archivosIlegibles.push(v.name || par[0]); return null; }
+        );
+      }
+      return Promise.resolve(v);
+    });
+
+    Promise.all(copias).then(function (valores) {
+    if (archivosIlegibles.length) {
+      terminar("No se pudo leer este archivo en tu dispositivo: " + archivosIlegibles.join(", ") +
+        ". Suele pasar cuando está en Drive, WhatsApp u otra nube y no se ha descargado, o cuando se movió o se borró. " +
+        "Descárgalo primero a tu teléfono (carpeta Descargas), quita el archivo del formulario, vuelve a seleccionarlo e inténtalo de nuevo.", true);
+      return;
+    }
+    var datos = new FormData();
+    entradas.forEach(function (par, i) {
+      var v = valores[i];
+      if (par[1] && typeof par[1] === "object" && v !== par[1] && v) datos.append(par[0], v, par[1].name);
+      else datos.append(par[0], v);
+    });
 
     var totalBytes = 0;
     datos.forEach(function (v) { if (v && typeof v === "object" && v.size) totalBytes += v.size; });
@@ -657,13 +691,18 @@ function configurarFormularioConProgreso(opciones) {
       .catch(function (err) {
         var red = (err && (err.name === "TypeError" || /failed to fetch|load failed|network/i.test(err.message || "")));
         if (red) {
+          try {
+            var info = "tamaño=" + mb + "MB; error=" + (err && err.name) + ": " + (err && err.message) + "; " + navigator.userAgent;
+            navigator.sendBeacon("/error_cliente", info.slice(0, 600));
+          } catch (e2) { /* solo diagnóstico */ }
           terminar("Se perdió la conexión con el servidor (se intentó dos veces; " + mb + " MB en total). " +
             "No se borró nada: conéctate a una red estable (mejor WiFi), mantén la pantalla encendida y la pestaña abierta, e inténtalo de nuevo. " +
-            "Si sigue pasando, avisa a Jair indicando el tamaño de tus archivos.", true);
+            "Si sigue pasando, prueba desde otro navegador o desde una computadora, o avisa a Jair indicando el tamaño de tus archivos.", true);
         } else {
           terminar("Ocurrió un error: " + err.message + " (no se borró nada, puedes reintentar).", true);
         }
       });
+    });
   });
 }
 </script>
@@ -1156,6 +1195,16 @@ def _generar_eventos_validacion(tmp, rutas, candidato, categoria_por_ruta=None):
         yield _evento_sse({"tipo": "error", "error": str(e)})
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+@app.route("/error_cliente", methods=["POST"])
+def error_cliente():
+    """Diagnóstico: el navegador avisa (sendBeacon) cuando falla una subida por
+    red, para poder ver en los registros qué dispositivo/navegador y qué error.
+    Solo se guarda un texto corto en el registro; no se guarda nada más."""
+    texto = request.get_data(as_text=True)[:600].replace("\n", " ")
+    print("[cliente] " + texto, file=sys.stderr, flush=True)
+    return ("", 204)
 
 
 @app.route("/validar", methods=["POST"])
