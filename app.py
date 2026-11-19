@@ -59,6 +59,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import zipfile
 from functools import wraps
 
@@ -557,6 +558,26 @@ function configurarFormularioConProgreso(opciones) {
     barra.max = 1;
     barraTexto.textContent = "Subiendo archivos...";
 
+    var datosOriginal = new FormData(form);
+    var entradas = [];
+    datosOriginal.forEach(function (v, k) { entradas.push([k, v]); });
+
+    function esArchivo(v) {
+      return v && typeof v === "object" && typeof v.size === "number" && v.name !== undefined;
+    }
+    var totalBytesSeleccion = 0;
+    entradas.forEach(function (par) { if (esArchivo(par[1])) totalBytesSeleccion += par[1].size; });
+    var mb = (totalBytesSeleccion / 1048576).toFixed(1);
+
+    function esperar(ms) { return new Promise(function (ok) { setTimeout(ok, ms); }); }
+
+    function mensajeIlegible(nombres) {
+      return "No se pudo leer este archivo en tu dispositivo: " + nombres.join(", ") +
+        ". Suele pasar cuando está en Drive, WhatsApp u otra nube y no se ha descargado, o cuando se movió o se borró. " +
+        "Descárgalo primero a tu teléfono (carpeta Descargas), quita el archivo del formulario, vuelve a seleccionarlo e inténtalo de nuevo.";
+    }
+
+    // Modo normal (carga masiva): todos los archivos en una sola petición.
     // Antes de subir, cada archivo se copia a la memoria del navegador. En
     // celulares (sobre todo Android), un archivo elegido desde Drive, WhatsApp,
     // Descargas en la nube, etc. puede moverse, cambiar o no estar realmente
@@ -564,38 +585,111 @@ function configurarFormularioConProgreso(opciones) {
     // fetch" aunque la red esté perfecta, y el reintento falla igual. Con la
     // copia en memoria eso ya no puede pasar, y si un archivo no se puede leer
     // se avisa cuál es (en vez de culpar a la conexión).
-    var datosOriginal = new FormData(form);
-    var entradas = [];
-    datosOriginal.forEach(function (v, k) { entradas.push([k, v]); });
-    var archivosIlegibles = [];
-    var copias = entradas.map(function (par) {
-      var v = par[1];
-      if (v && typeof v === "object" && v.size && typeof v.arrayBuffer === "function") {
-        return v.arrayBuffer().then(
-          function (buf) { return new Blob([buf], { type: v.type || "application/pdf" }); },
-          function () { archivosIlegibles.push(v.name || par[0]); return null; }
-        );
-      }
-      return Promise.resolve(v);
-    });
+    function prepararEnUnaPeticion() {
+      var ilegibles = [];
+      var copias = entradas.map(function (par) {
+        var v = par[1];
+        if (esArchivo(v) && v.size && typeof v.arrayBuffer === "function") {
+          return v.arrayBuffer().then(
+            function (buf) { return new Blob([buf], { type: v.type || "application/pdf" }); },
+            function () { ilegibles.push(v.name || par[0]); return null; }
+          );
+        }
+        return Promise.resolve(v);
+      });
+      return Promise.all(copias).then(function (valores) {
+        if (ilegibles.length) return { error: mensajeIlegible(ilegibles) };
+        var datos = new FormData();
+        entradas.forEach(function (par, i) {
+          var v = valores[i];
+          if (esArchivo(par[1]) && v !== par[1] && v) datos.append(par[0], v, par[1].name);
+          else datos.append(par[0], v);
+        });
+        return { datos: datos };
+      });
+    }
 
-    Promise.all(copias).then(function (valores) {
-    if (archivosIlegibles.length) {
-      terminar("No se pudo leer este archivo en tu dispositivo: " + archivosIlegibles.join(", ") +
-        ". Suele pasar cuando está en Drive, WhatsApp u otra nube y no se ha descargado, o cuando se movió o se borró. " +
-        "Descárgalo primero a tu teléfono (carpeta Descargas), quita el archivo del formulario, vuelve a seleccionarlo e inténtalo de nuevo.", true);
+    // Modo "por partes" (carga individual): cada PDF se sube en su propia
+    // petición a /subir_parte y al final /validar solo recibe los datos del
+    // formulario y un código de la subida. Así el límite de 32 MB de la
+    // plataforma aplica a cada archivo por separado y no a la suma, y cada
+    // petición es más corta (más estable en celulares).
+    function nuevoToken() {
+      var a = new Uint8Array(16);
+      (window.crypto || window.msCrypto).getRandomValues(a);
+      return Array.prototype.map.call(a, function (b) { return ("0" + b.toString(16)).slice(-2); }).join("");
+    }
+
+    function subirUnaParte(token, orden, campo, blob, nombre, intento) {
+      var fd = new FormData();
+      fd.append("token", token);
+      fd.append("campo", campo);
+      fd.append("orden", String(orden));
+      fd.append("archivo", blob, nombre);
+      return fetch("/subir_parte", { method: "POST", body: fd }).then(function (resp) {
+        if (resp.ok) return;
+        if (resp.status >= 500 && intento < 3) {
+          return esperar(2000 * intento).then(function () { return subirUnaParte(token, orden, campo, blob, nombre, intento + 1); });
+        }
+        return resp.text().then(function (txt) {
+          throw new Error("El servidor no aceptó el archivo " + nombre + " (" + resp.status + "): " + (txt || "").slice(0, 200));
+        });
+      }, function (err) {
+        if (intento < 3) {
+          barraTexto.textContent = "Se cortó la conexión, reintentando con " + nombre + "...";
+          return esperar(2000 * intento).then(function () { return subirUnaParte(token, orden, campo, blob, nombre, intento + 1); });
+        }
+        throw err;
+      });
+    }
+
+    function prepararPorPartes() {
+      var token = nuevoToken();
+      var archivos = [];
+      var datos = new FormData();
+      entradas.forEach(function (par) {
+        if (esArchivo(par[1])) {
+          if (par[1].size) archivos.push(par);
+        } else {
+          datos.append(par[0], par[1]);
+        }
+      });
+      var total = archivos.length;
+      barra.max = total + 1;
+      barra.value = 0;
+      var cadena = Promise.resolve();
+      archivos.forEach(function (par, idx) {
+        cadena = cadena.then(function () {
+          var v = par[1];
+          barraTexto.textContent = "Subiendo archivo " + (idx + 1) + " de " + total + ": " + v.name;
+          var leer = (typeof v.arrayBuffer === "function")
+            ? v.arrayBuffer().then(function (buf) { return new Blob([buf], { type: v.type || "application/pdf" }); })
+            : Promise.resolve(v);
+          return leer.then(function (blob) {
+            return subirUnaParte(token, idx, par[0], blob, v.name, 1);
+          }, function (errLectura) {
+            if (errLectura && errLectura.name === "TypeError") throw errLectura;
+            var e = new Error(mensajeIlegible([v.name]));
+            e.esLectura = true;
+            throw e;
+          }).then(function () { barra.value = idx + 1; });
+        });
+      });
+      return cadena.then(function () {
+        datos.append("token_subida", token);
+        datos.append("n_archivos", String(total));
+        return { datos: datos };
+      });
+    }
+
+    var prepararDatos = opciones.subidaPorPartes ? prepararPorPartes : prepararEnUnaPeticion;
+
+    prepararDatos().then(function (preparado) {
+    if (preparado.error) {
+      terminar(preparado.error, true);
       return;
     }
-    var datos = new FormData();
-    entradas.forEach(function (par, i) {
-      var v = valores[i];
-      if (par[1] && typeof par[1] === "object" && v !== par[1] && v) datos.append(par[0], v, par[1].name);
-      else datos.append(par[0], v);
-    });
-
-    var totalBytes = 0;
-    datos.forEach(function (v) { if (v && typeof v === "object" && v.size) totalBytes += v.size; });
-    var mb = (totalBytes / 1048576).toFixed(1);
+    var datos = preparado.datos;
 
     // Si la conexión se cae ANTES de que el servidor responda (típico en
     // celulares con señal débil o pantalla que se bloquea), se reintenta una
@@ -702,6 +796,23 @@ function configurarFormularioConProgreso(opciones) {
           terminar("Ocurrió un error: " + err.message + " (no se borró nada, puedes reintentar).", true);
         }
       });
+    }).catch(function (err) {
+      // Falló la subida de alguno de los archivos (modo por partes) o su lectura.
+      if (err && err.esLectura) {
+        terminar(err.message, true);
+        return;
+      }
+      var red = (err && (err.name === "TypeError" || /failed to fetch|load failed|network/i.test(err.message || "")));
+      if (red) {
+        try {
+          var info2 = "subida por partes; tamaño=" + mb + "MB; error=" + (err && err.name) + ": " + (err && err.message) + "; " + navigator.userAgent;
+          navigator.sendBeacon("/error_cliente", info2.slice(0, 600));
+        } catch (e3) { /* solo diagnóstico */ }
+        terminar("Se perdió la conexión mientras se subían los archivos (se reintentó varias veces; " + mb + " MB en total). " +
+          "No se borró nada: conéctate a una red estable (mejor WiFi), mantén la pantalla encendida y la pestaña abierta, e inténtalo de nuevo.", true);
+      } else {
+        terminar("Ocurrió un error subiendo los archivos: " + (err && err.message) + " (no se borró nada, puedes reintentar).", true);
+      }
     });
   });
 }
@@ -812,15 +923,13 @@ CONTENIDO_INDIVIDUAL = """
 </form>
 """ + JS_NUCLEO + """
 <script>
-// Límite de la plataforma (Cloud Run/GFE) para el tamaño de una sola
-// petición HTTP: 32 MiB fijos, sin excepción -no es algo que se pueda subir
-// desde la configuración de la app-. Se deja un margen (28 MB) para los
-// demás campos del formulario y la sobrecarga propia de multipart/form-data.
-// Si la suma de los PDF seleccionados pasa de ese margen, se avisa ANTES de
-// mandar la petición -así el usuario no espera para nada a que el servidor
-// (en realidad la plataforma, antes de llegar al servidor) la rechace con un
-// "413 Request Entity Too Large"-.
-var LIMITE_TAMANO_INDIVIDUAL_BYTES = 28 * 1024 * 1024;
+// Límites de la carga individual. Cada PDF se sube en su propia petición
+// (ver subidaPorPartes), y la plataforma (Cloud Run/GFE) limita CADA petición
+// a 32 MiB fijos; por eso el tope es POR ARCHIVO (28 MB deja margen para la
+// sobrecarga de multipart/form-data) y ya no por la suma. El tope total
+// (150 MB) solo evita subidas absurdas desde un celular.
+var LIMITE_TAMANO_ARCHIVO_BYTES = 28 * 1024 * 1024;
+var LIMITE_TAMANO_TOTAL_BYTES = 150 * 1024 * 1024;
 
 configurarFormularioConProgreso({
   formId: "formValidador",
@@ -831,6 +940,7 @@ configurarFormularioConProgreso({
   barraTextoId: "barraTexto",
   mensajeInicial: "Procesando documentos (puede tardar uno o dos minutos)...",
   descargar: false,
+  subidaPorPartes: true,
   antesDeEnviar: function () {
     var aviso = document.getElementById("avisoTamanoIndividual");
     var form = document.getElementById("formValidador");
@@ -843,23 +953,28 @@ configurarFormularioConProgreso({
         archivos.push(f);
       }
     });
-    if (total <= LIMITE_TAMANO_INDIVIDUAL_BYTES) {
-      aviso.style.display = "none";
-      return true;
-    }
     // Se ordenan de mayor a menor para señalar cuáles conviene comprimir
     // primero (normalmente son los documentos escaneados a mucha
     // resolución, como la CSF o el comprobante de domicilio).
     archivos.sort(function (a, b) { return b.size - a.size; });
-    var detalle = archivos.slice(0, 3).map(function (f) {
-      return f.name + " (" + (f.size / (1024 * 1024)).toFixed(1) + " MB)";
-    }).join(", ");
-    aviso.style.display = "block";
-    aviso.textContent = "Los documentos seleccionados suman " + (total / (1024 * 1024)).toFixed(1) +
-      " MB, y el límite de la plataforma es de aproximadamente 28 MB por envío. " +
-      "Los más pesados son: " + detalle + ". Vuelve a escanearlos a menor resolución (o " +
-      "comprime esos PDF) y vuelve a intentar.";
-    return false;
+    function mb(n) { return (n / (1024 * 1024)).toFixed(1) + " MB"; }
+    if (archivos.length && archivos[0].size > LIMITE_TAMANO_ARCHIVO_BYTES) {
+      var grandes = archivos.filter(function (f) { return f.size > LIMITE_TAMANO_ARCHIVO_BYTES; })
+        .map(function (f) { return f.name + " (" + mb(f.size) + ")"; }).join(", ");
+      aviso.style.display = "block";
+      aviso.textContent = "Cada archivo puede pesar hasta 28 MB, y este pasa del límite: " + grandes +
+        ". Vuelve a escanearlo a menor resolución (o comprímelo) y vuelve a intentar.";
+      return false;
+    }
+    if (total > LIMITE_TAMANO_TOTAL_BYTES) {
+      aviso.style.display = "block";
+      aviso.textContent = "Los documentos seleccionados suman " + mb(total) + " y el máximo por expediente es de 150 MB. " +
+        "Los más pesados son: " + archivos.slice(0, 3).map(function (f) { return f.name + " (" + mb(f.size) + ")"; }).join(", ") +
+        ". Reduce el tamaño de esos PDF y vuelve a intentar.";
+      return false;
+    }
+    aviso.style.display = "none";
+    return true;
   },
 });
 </script>
@@ -1197,6 +1312,117 @@ def _generar_eventos_validacion(tmp, rutas, candidato, categoria_por_ruta=None):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# Subida por partes (carga individual)
+# ---------------------------------------------------------------------------
+# Cloud Run limita CADA petición HTTP a 32 MiB. Para que un candidato pueda
+# subir más que eso en total, el formulario individual manda cada PDF en su
+# propia petición a /subir_parte (que lo deja en un área temporal del mismo
+# bucket, bajo "staging/<código>/...", o en disco si no hay bucket) y al final
+# /validar recibe solo los datos del formulario y ese código: ahí baja los
+# archivos y sigue igual que antes. El bucket se usa (y no el disco) porque
+# Cloud Run puede atender cada petición en una instancia distinta.
+_TOKEN_SUBIDA_RE = re.compile(r"^[0-9a-f]{32}$")
+STAGING_LOCAL_DIR = os.path.join(tempfile.gettempdir(), "validador_staging")
+_CAMPOS_VALIDOS_SUBIDA = {c for c, _e, _o in CAMPOS_DOCUMENTOS} | {"otros"}
+
+
+def _nombre_pdf_seguro(nombre):
+    """Solo el nombre del archivo (sin carpetas ni puntos al inicio)."""
+    base = os.path.basename((nombre or "").replace("\\", "/")).strip().lstrip(".")
+    return base[:150]
+
+
+def _staging_nombre(campo, orden, nombre):
+    return f"{campo}/{int(orden):03d}__{urllib.parse.quote(nombre, safe='')}"
+
+
+def _staging_guardar(token, campo, orden, nombre, ruta_local):
+    clave = _staging_nombre(campo, orden, nombre)
+    if GCS_BUCKET_EXPEDIENTES:
+        bucket = _cliente_gcs().bucket(GCS_BUCKET_EXPEDIENTES)
+        bucket.blob(f"staging/{token}/{clave}").upload_from_filename(ruta_local, content_type="application/pdf")
+    else:
+        destino = os.path.join(STAGING_LOCAL_DIR, token, clave)
+        os.makedirs(os.path.dirname(destino), exist_ok=True)
+        shutil.copyfile(ruta_local, destino)
+
+
+def _staging_bajar_y_borrar(token, dir_destino):
+    """Baja a 'dir_destino' todos los archivos de esa subida y los borra del
+    área temporal. Regresa [(campo, ruta_local), ...]."""
+    partes = []  # (campo, orden, nombre, clave_origen)
+    if GCS_BUCKET_EXPEDIENTES:
+        bucket = _cliente_gcs().bucket(GCS_BUCKET_EXPEDIENTES)
+        prefijo = f"staging/{token}/"
+        blobs = list(bucket.list_blobs(prefix=prefijo))
+        origenes = [(b, b.name[len(prefijo):]) for b in blobs]
+    else:
+        base = os.path.join(STAGING_LOCAL_DIR, token)
+        origenes = []
+        if os.path.isdir(base):
+            for campo in sorted(os.listdir(base)):
+                for archivo in sorted(os.listdir(os.path.join(base, campo))):
+                    origenes.append((os.path.join(base, campo, archivo), f"{campo}/{archivo}"))
+    resultado = []
+    usados = set()
+    for origen, clave in sorted(origenes, key=lambda par: par[1]):
+        campo, _, resto = clave.partition("/")
+        nombre = urllib.parse.unquote(resto.split("__", 1)[-1]) if "__" in resto else resto
+        nombre = _nombre_pdf_seguro(nombre) or "documento.pdf"
+        destino = os.path.join(dir_destino, nombre)
+        n = 2
+        while destino in usados or os.path.exists(destino):
+            raiz, ext = os.path.splitext(nombre)
+            destino = os.path.join(dir_destino, f"{raiz}_{n}{ext}")
+            n += 1
+        usados.add(destino)
+        if GCS_BUCKET_EXPEDIENTES:
+            origen.download_to_filename(destino)
+        else:
+            shutil.copyfile(origen, destino)
+        resultado.append((campo, destino))
+    # Ya descargados: se borra el área temporal de esta subida.
+    if GCS_BUCKET_EXPEDIENTES:
+        for origen, _clave in origenes:
+            try:
+                origen.delete()
+            except Exception:
+                pass
+    else:
+        shutil.rmtree(os.path.join(STAGING_LOCAL_DIR, token), ignore_errors=True)
+    return resultado
+
+
+@app.route("/subir_parte", methods=["POST"])
+def subir_parte():
+    """Recibe UN archivo de la carga individual (ver comentario de arriba)."""
+    token = request.form.get("token", "")
+    campo = request.form.get("campo", "")
+    orden = request.form.get("orden", "0")
+    f = request.files.get("archivo")
+    if not _TOKEN_SUBIDA_RE.match(token) or campo not in _CAMPOS_VALIDOS_SUBIDA:
+        return "Solicitud de subida no válida", 400
+    if not (f and f.filename) or not orden.isdigit() or int(orden) > 999:
+        return "Solicitud de subida no válida", 400
+    nombre = _nombre_pdf_seguro(f.filename)
+    if not nombre:
+        return "Nombre de archivo no válido", 400
+    fd, ruta_tmp = tempfile.mkstemp(prefix="parte_")
+    os.close(fd)
+    try:
+        f.save(ruta_tmp)
+        _staging_guardar(token, campo, orden, nombre, ruta_tmp)
+    except Exception as e:
+        print(f"[subir_parte] ERROR guardando '{nombre}': {e}", file=sys.stderr, flush=True)
+        return "No se pudo guardar el archivo en el servidor; inténtalo de nuevo.", 500
+    finally:
+        if os.path.exists(ruta_tmp):
+            os.remove(ruta_tmp)
+    print(f"[subir_parte] recibido '{nombre}' ({campo})", file=sys.stderr, flush=True)
+    return ("", 204)
+
+
 @app.route("/error_cliente", methods=["POST"])
 def error_cliente():
     """Diagnóstico: el navegador avisa (sendBeacon) cuando falla una subida por
@@ -1249,6 +1475,22 @@ def validar():
         # Los archivos de "otros" no tienen un campo/categoría conocida, así
         # que esos sí se siguen clasificando por contenido, como antes.
         categoria_por_ruta = {}
+        token_subida = request.form.get("token_subida", "").strip()
+        if token_subida:
+            # Subida por partes: los archivos ya están en el área temporal.
+            if not _TOKEN_SUBIDA_RE.match(token_subida):
+                shutil.rmtree(tmp, ignore_errors=True)
+                return "Código de subida no válido", 400
+            esperados = request.form.get("n_archivos", "")
+            partes = _staging_bajar_y_borrar(token_subida, tmp)
+            if esperados.isdigit() and len(partes) != int(esperados):
+                shutil.rmtree(tmp, ignore_errors=True)
+                return (f"Solo llegaron {len(partes)} de {esperados} archivos al servidor. "
+                        "No se borró nada: vuelve a intentarlo."), 400
+            for campo, ruta in partes:
+                rutas.append(ruta)
+                if campo != "otros":
+                    categoria_por_ruta[ruta] = campo.upper()
         for campo, _etiqueta, _ob in CAMPOS_DOCUMENTOS:
             f = request.files.get(campo)
             if f and f.filename:
